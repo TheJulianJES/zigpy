@@ -345,8 +345,7 @@ async def test_quirks_v2_removes(device_mock):
 
     (
         QuirkBuilder(device_mock.manufacturer, device_mock.model, registry=registry)
-        .removes(Identify.cluster_id)  # existing cluster and endpoint
-        .removes(Identify.cluster_id, endpoint_id=2)  # non-existent endpoint
+        .removes(Identify.cluster_id)
         .add_to_registry()
     )
 
@@ -890,6 +889,7 @@ async def test_quirks_v2_matches_v1(app_mock):
     (
         QuirkBuilder(ikea_device.manufacturer, ikea_device.model, registry=registry)
         .replaces(PowerConfig1CRCluster)
+        .replaces(PowerConfig1CRCluster, endpoint_id=2)  # non-existent endpoint
         .replaces(ScenesCluster, cluster_type=ClusterType.Client)
         .device_automation_triggers(triggers)
         .add_to_registry()
