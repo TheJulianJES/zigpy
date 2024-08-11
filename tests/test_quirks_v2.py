@@ -125,7 +125,7 @@ async def test_quirks_v2(device_mock):
     # this would need to be updated if the line number of the call to QuirkBuilder
     # changes in this test in the future
     assert quirked.quirk_metadata.quirk_location.endswith(
-        "zigpy/tests/test_quirks_v2.py]-line:105"
+        "zigpy/tests/test_quirks_v2.py]-line:103"
     )
 
     ep = quirked.endpoints[1]
