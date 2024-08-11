@@ -125,7 +125,7 @@ async def test_quirks_v2(device_mock):
     # this would need to be updated if the line number of the call to QuirkBuilder
     # changes in this test in the future
     assert quirked.quirk_metadata.quirk_location.endswith(
-        "zigpy/tests/test_quirks_v2.py]-line:103"
+        "zigpy/tests/test_quirks_v2.py]-line:105"
     )
 
     ep = quirked.endpoints[1]
@@ -345,7 +345,8 @@ async def test_quirks_v2_removes(device_mock):
 
     (
         QuirkBuilder(device_mock.manufacturer, device_mock.model, registry=registry)
-        .removes(Identify.cluster_id)
+        .removes(Identify.cluster_id)  # existing cluster and endpoint
+        .removes(Identify.cluster_id, endpoint_id=2)  # non-existent endpoint
         .add_to_registry()
     )
 
