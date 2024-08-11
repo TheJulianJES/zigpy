@@ -195,11 +195,11 @@ class RemovesMetadata:
 
     def __call__(self, device: CustomDeviceV2) -> None:
         """Process the remove."""
-        endpoint = device.endpoints[self.endpoint_id]
-        if self.cluster_type == ClusterType.Server:
-            endpoint.in_clusters.pop(self.cluster_id, None)
-        else:
-            endpoint.out_clusters.pop(self.cluster_id, None)
+        if endpoint := device.endpoints.get(self.endpoint_id):
+            if self.cluster_type == ClusterType.Server:
+                endpoint.in_clusters.pop(self.cluster_id, None)
+            else:
+                endpoint.out_clusters.pop(self.cluster_id, None)
 
 
 @attrs.define(frozen=True, kw_only=True, repr=True)
