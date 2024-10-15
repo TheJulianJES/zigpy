@@ -6,7 +6,7 @@ on:
 
 jobs:
   shared-ci:
-    uses: zigpy/workflows/.github/workflows/ci.yml@main
+    uses: TheJulianJES/workflows/.github/workflows/ci.yml@tjj/update_ci_20241015
     with:
       CODE_FOLDER: zigpy
       CACHE_VERSION: 3
