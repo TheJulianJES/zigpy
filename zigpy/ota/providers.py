@@ -686,6 +686,7 @@ class ZigpyOtaProvider(BaseZigpyProvider):
     VERSION_FILE_BASE_URL = (
         "https://raw.githubusercontent.com/zigpy/zigpy-ota/release/version"
     )
+    SCHEMA_NAME = "zigpy_v1"
 
     # Combined SSL context for downloading images from IKEA and Hue servers
     # (zigpy-ota index may point to images hosted on these servers)
@@ -723,7 +724,16 @@ class ZigpyOtaProvider(BaseZigpyProvider):
 
         # Extract the index URL from the version file
         # Format: {"schemas": {"zigpy_v1": {"version": "...", "url": "..."}}}
-        index_url = version_data["schemas"]["zigpy_v1"]["url"]
+        schemas = version_data.get("schemas", {})
+
+        if self.SCHEMA_NAME not in schemas:
+            raise ValueError(
+                f"Unsupported zigpy-ota index: {self.SCHEMA_NAME!r} schema not found. "
+                f"Available schemas: {list(schemas.keys())}. "
+                f"Please update zigpy to a newer version."
+            )
+
+        index_url = schemas[self.SCHEMA_NAME]["url"]
 
         # Now fetch the actual OTA index
         async with session.get(index_url) as rsp:
