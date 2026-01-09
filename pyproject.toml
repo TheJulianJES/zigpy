@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel", "setuptools-git-versioning<2"]
+requires = ["setuptools>=80", "wheel", "setuptools-scm[simple]>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -46,9 +46,6 @@ testing = [
     "freezegun",
     'pysqlite3-binary; platform_system=="Linux" and python_version<"3.12"',
 ]
-
-[tool.setuptools-git-versioning]
-enabled = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
