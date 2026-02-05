@@ -66,13 +66,28 @@ class AttributeCache:
     def is_unsupported(self, attr_def: ZCLAttributeDef) -> bool:
         return _cache_key(attr_def) in self._unsupported
 
-    def get_value(self, attr_def: ZCLAttributeDef) -> Any:
+    def _get_cache_item(self, attr_def: ZCLAttributeDef) -> CacheItem:
+        """Get cache item, checking typed cache first, then legacy cache."""
+        key = _cache_key(attr_def)
+
+        # Check typed cache first
+        if key in self._cache:
+            return self._cache[key]
+
+        # Fall back to legacy cache
+        if attr_def.id in self._legacy_cache:
+            return self._legacy_cache[attr_def.id]
+
+        # Only raise unsupported if no value was found in either cache
         self._raise_if_unsupported(attr_def)
-        return self._cache[_cache_key(attr_def)].value
+
+        raise KeyError(key)
+
+    def get_value(self, attr_def: ZCLAttributeDef) -> Any:
+        return self._get_cache_item(attr_def).value
 
     def get_last_updated(self, attr_def: ZCLAttributeDef) -> datetime:
-        self._raise_if_unsupported(attr_def)
-        return self._cache[_cache_key(attr_def)].last_updated
+        return self._get_cache_item(attr_def).last_updated
 
     def set_value(
         self,
