@@ -2218,3 +2218,41 @@ async def test_quirk_manufacturer_code_context_isolation(app_mock) -> None:
         raw_value=42,
         value=42,
     )
+
+    # Now report the standard attribute (same ID, no manufacturer code)
+    events.clear()
+    await mock_attribute_report(
+        cluster, {TestCluster.AttributeDefs.standard_attr: t.uint8_t(77)}
+    )
+
+    # Verify that the standard attribute was stored correctly
+    assert cluster._attr_cache.get_value(TestCluster.AttributeDefs.standard_attr) == 77
+
+    # Verify that the manufacturer-specific attribute was NOT overwritten
+    assert cluster._attr_cache.get_value(TestCluster.AttributeDefs.manuf_attr) == 42
+
+    # Verify the events: other_attr updated again (quirk triggers), then standard_attr reported
+    assert len(events) == 2
+
+    assert events[0] == AttributeUpdatedEvent(
+        device_ieee=str(dev.ieee),
+        endpoint_id=1,
+        cluster_type=zcl.ClusterType.Server,
+        cluster_id=TestCluster.cluster_id,
+        attribute_name="other_attr",
+        attribute_id=TestCluster.AttributeDefs.other_attr.id,
+        manufacturer_code=None,
+        value=99,
+    )
+
+    assert events[1] == AttributeReportedEvent(
+        device_ieee=str(dev.ieee),
+        endpoint_id=1,
+        cluster_type=zcl.ClusterType.Server,
+        cluster_id=TestCluster.cluster_id,
+        attribute_name="standard_attr",
+        attribute_id=TestCluster.AttributeDefs.standard_attr.id,
+        manufacturer_code=None,
+        raw_value=77,
+        value=77,
+    )
