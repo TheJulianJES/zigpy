@@ -152,6 +152,28 @@ def test_cache_legacy_fallback() -> None:
     assert 0x9999 in cache
 
 
+def test_cache_legacy_value_takes_precedence_over_unsupported() -> None:
+    """Test that legacy cache value is returned even if attribute is marked unsupported."""
+    endpoint = MagicMock(spec=zigpy.endpoint.Endpoint)
+    cluster = HelperCluster(endpoint)
+    cache = cluster._attr_cache
+
+    attr1 = HelperCluster.AttributeDefs.attr1
+
+    # Set value in legacy cache (simulating quirk behavior)
+    cache.set_legacy_value(attr1.id, "legacy_value")
+
+    # Mark the attribute as unsupported
+    cache.mark_unsupported(attr1)
+    assert cache.is_unsupported(attr1)
+
+    # get_value should return the legacy value instead of raising UnsupportedAttribute
+    assert cache.get_value(attr1) == "legacy_value"
+
+    # get_last_updated should also work
+    assert cache.get_last_updated(attr1) is not None
+
+
 def test_cache_clone() -> None:
     """Test cloning a cache for a new cluster."""
     endpoint = MagicMock(spec=zigpy.endpoint.Endpoint)
