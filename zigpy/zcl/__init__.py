@@ -53,6 +53,27 @@ def _suppress_attribute_update_event(
         _suppressed_attribute_updates.reset(token)
 
 
+# Tracks (cluster_id, attrid) pairs for constant attribute updates that should not
+# be persisted to the attribute cache or database.
+_constant_attribute_ids: ContextVar[frozenset[tuple[int, int]]] = ContextVar(
+    "_constant_attribute_ids", default=frozenset()
+)
+
+
+@contextlib.contextmanager
+def _mark_constant_attribute_update(
+    cluster_id: int, attrid: int
+) -> Generator[None, None, None]:
+    """Mark an attribute update as constant, preventing cache and DB persistence."""
+    current = _constant_attribute_ids.get()
+    token = _constant_attribute_ids.set(current | {(cluster_id, attrid)})
+
+    try:
+        yield
+    finally:
+        _constant_attribute_ids.reset(token)
+
+
 class ClusterType(enum.IntEnum):
     Server = 0
     Client = 1
@@ -1041,6 +1062,22 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, EventBase):
 
                         success[attribute_map[attr_def]] = value
 
+                        # Check if this is a constant attribute that should
+                        # not be persisted to the cache or database.
+                        constant_attrs = getattr(self, "_CONSTANT_ATTRIBUTES", None)
+                        is_constant_attr = (
+                            constant_attrs is not None and attr_def.id in constant_attrs
+                        )
+
+                        if is_constant_attr:
+                            with _mark_constant_attribute_update(
+                                self.cluster_id, attr_def.id
+                            ):
+                                self._legacy_apply_quirk_attribute_update(
+                                    attr_def, value
+                                )
+                            continue
+
                         cached_value = self._legacy_apply_quirk_attribute_update(
                             attr_def, value
                         )
@@ -1113,10 +1150,14 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, EventBase):
         # other clusters or attributes to emit their own events.
         suppressed = (self.cluster_id, attrid) in _suppressed_attribute_updates.get()
 
+        # Check if this attribute is a constant attribute update that should not be
+        # persisted to the attribute cache or database.
+        is_constant = (self.cluster_id, attrid) in _constant_attribute_ids.get()
+
         try:
             attr_def = self.find_attribute(attrid)
         except KeyError:
-            if value is not None:
+            if value is not None and not is_constant:
                 self._attr_cache.set_legacy_value(attrid, value)
 
                 if not suppressed:
@@ -1142,23 +1183,27 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, EventBase):
             return
 
         if value is None:
-            self._attr_cache.remove(attr_def)
-            self.emit(
-                AttributeClearedEvent.event_type,
-                AttributeClearedEvent(
-                    device_ieee=str(self.endpoint.device.ieee),
-                    endpoint_id=self.endpoint.endpoint_id,
-                    cluster_type=self._type,
-                    cluster_id=self.cluster_id,
-                    attribute_name=attr_def.name,
-                    attribute_id=attr_def.id,
-                    manufacturer_code=self._get_effective_manufacturer_code(attr_def),
-                ),
-            )
+            if not is_constant:
+                self._attr_cache.remove(attr_def)
+                self.emit(
+                    AttributeClearedEvent.event_type,
+                    AttributeClearedEvent(
+                        device_ieee=str(self.endpoint.device.ieee),
+                        endpoint_id=self.endpoint.endpoint_id,
+                        cluster_type=self._type,
+                        cluster_id=self.cluster_id,
+                        attribute_name=attr_def.name,
+                        attribute_id=attr_def.id,
+                        manufacturer_code=self._get_effective_manufacturer_code(
+                            attr_def
+                        ),
+                    ),
+                )
         else:
-            self._attr_cache.set_value(attr_def, value)
+            if not is_constant:
+                self._attr_cache.set_value(attr_def, value)
 
-            if not suppressed:
+            if not suppressed and not is_constant:
                 self.emit(
                     AttributeUpdatedEvent.event_type,
                     AttributeUpdatedEvent(
