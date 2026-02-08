@@ -1910,6 +1910,108 @@ async def test_report_attributes_quirk_transforms_value(app_mock):
     ]
 
 
+async def test_constant_attributes_not_cached(app_mock) -> None:
+    """Test that _CONSTANT_ATTRIBUTES are not persisted to cache or emitted as events."""
+    from zigpy.quirks import CustomCluster
+
+    class ConstantCluster(CustomCluster):
+        cluster_id = 0xABCD
+        ep_attribute = "constant_test"
+
+        _CONSTANT_ATTRIBUTES = {0x0001: 42}
+
+        class AttributeDefs(zcl.foundation.BaseAttributeDefs):
+            normal_attr = foundation.ZCLAttributeDef(
+                id=0x0000, type=t.uint8_t, access="r"
+            )
+            constant_attr = foundation.ZCLAttributeDef(
+                id=0x0001, type=t.uint8_t, access="r"
+            )
+            other_attr = foundation.ZCLAttributeDef(
+                id=0x0002, type=t.uint8_t, access="r"
+            )
+
+        def _update_attribute(self, attrid, value):
+            if attrid == self.AttributeDefs.constant_attr.id:
+                # Quirk updates another attribute as side effect
+                super()._update_attribute(self.AttributeDefs.other_attr.id, value + 1)
+            super()._update_attribute(attrid, value)
+
+    dev = add_initialized_device(app_mock, nwk=0x1234, ieee=make_ieee(1))
+    cluster = ConstantCluster(dev.endpoints[1])
+    dev.endpoints[1].add_input_cluster(ConstantCluster.cluster_id, cluster)
+
+    events = []
+    cluster.on_event(AttributeReadEvent.event_type, events.append)
+    cluster.on_event(AttributeUpdatedEvent.event_type, events.append)
+
+    # Mock device communication (not read_attributes_raw, so CustomCluster's
+    # constant attribute handling is preserved)
+    async def mockrequest(fnd, command, schema, args, manufacturer=None, **kwargs):
+        return [
+            [
+                foundation.ReadAttributeRecord(
+                    attrid=attr_id,
+                    status=foundation.Status.SUCCESS,
+                    value=foundation.TypeValue(type=None, value=99),
+                )
+                for attr_id in args
+            ]
+        ]
+
+    cluster.request = mockrequest
+
+    # Read both constant and normal attributes
+    success, failure = await cluster.read_attributes(
+        [
+            ConstantCluster.AttributeDefs.normal_attr,
+            ConstantCluster.AttributeDefs.constant_attr,
+        ]
+    )
+
+    # Both values should be returned successfully
+    assert success[ConstantCluster.AttributeDefs.normal_attr] == 99
+    assert success[ConstantCluster.AttributeDefs.constant_attr] == 42
+
+    # Constant attribute must NOT be in the attribute cache
+    assert ConstantCluster.AttributeDefs.constant_attr not in cluster._attr_cache
+
+    # Normal attribute should be in the cache
+    assert (
+        cluster._attr_cache.get_value(ConstantCluster.AttributeDefs.normal_attr) == 99
+    )
+
+    # Side-effect attribute from quirk's _update_attribute should persist
+    assert cluster._attr_cache.get_value(ConstantCluster.AttributeDefs.other_attr) == 43
+
+    # Events: only normal_attr read event and side-effect update event should fire
+    assert events == [
+        # Side-effect from quirk: other_attr updated when constant_attr was processed
+        AttributeUpdatedEvent(
+            device_ieee=str(dev.ieee),
+            endpoint_id=1,
+            cluster_type=zcl.ClusterType.Server,
+            cluster_id=ConstantCluster.cluster_id,
+            attribute_name="other_attr",
+            attribute_id=ConstantCluster.AttributeDefs.other_attr.id,
+            manufacturer_code=None,
+            value=43,
+        ),
+        # Normal attribute read event
+        AttributeReadEvent(
+            device_ieee=str(dev.ieee),
+            endpoint_id=1,
+            cluster_type=zcl.ClusterType.Server,
+            cluster_id=ConstantCluster.cluster_id,
+            attribute_name="normal_attr",
+            attribute_id=ConstantCluster.AttributeDefs.normal_attr.id,
+            manufacturer_code=None,
+            raw_value=99,
+            value=99,
+        ),
+    ]
+
+
 async def test_zcl_write_attributes_update_cache(app_mock) -> None:
     """Test that `write_attributes` can skip updating the attribute cache."""
     dev = add_initialized_device(app_mock, nwk=0x1234, ieee=make_ieee(1))
