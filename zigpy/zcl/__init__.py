@@ -859,9 +859,19 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, EventBase):
                     value = attr_def.type(attr.value.value)
 
                 if attr_def is None:
-                    # Unknown attribute, update and emit reported event
-                    with _suppress_attribute_update_event(self.cluster_id, attr.attrid):
-                        self._update_attribute(attr.attrid, value)
+                    if hdr.manufacturer is not None:
+                        # Manufacturer-specific report for an unknown attribute.
+                        # Store in legacy cache directly to avoid _update_attribute
+                        # finding a standard ZCL attribute with the same ID.
+                        if value is not None:
+                            self._attr_cache.set_legacy_value(attr.attrid, value)
+                    else:
+                        # Non-manufacturer-specific unknown attribute. Go through
+                        # _update_attribute so quirk overrides are called.
+                        with _suppress_attribute_update_event(
+                            self.cluster_id, attr.attrid
+                        ):
+                            self._update_attribute(attr.attrid, value)
 
                     self.emit(
                         AttributeReportedEvent.event_type,
