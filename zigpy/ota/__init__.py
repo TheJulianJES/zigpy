@@ -13,12 +13,14 @@ import typing
 from zigpy.config import (
     CONF_OTA_ADVANCED_DIR,
     CONF_OTA_ALLOW_ADVANCED_DIR,
+    CONF_OTA_CHANNEL,
     CONF_OTA_DISABLE_DEFAULT_PROVIDERS,
     CONF_OTA_ENABLED,
     CONF_OTA_EXTRA_PROVIDERS,
     CONF_OTA_IKEA,
     CONF_OTA_INOVELLI,
     CONF_OTA_LEDVANCE,
+    CONF_OTA_PROVIDER_CHANNEL,
     CONF_OTA_PROVIDER_MANUF_IDS,
     CONF_OTA_PROVIDER_TYPE,
     CONF_OTA_PROVIDER_URL,
@@ -264,6 +266,8 @@ class OTA:
         # Config gets a little complicated when you mix deprecated config and the new
         # providers config. We treat every option as an "intent" and merge configs in
         # the end.
+        ota_channel = config[CONF_OTA_CHANNEL]
+
         def provider_type(
             provider_config: dict[str, typing.Any],
         ) -> type[zigpy.ota.providers.BaseOtaProvider]:
@@ -280,6 +284,13 @@ class OTA:
 
             kwargs = dict(provider_config)
             kwargs.pop(CONF_OTA_PROVIDER_TYPE)
+
+            if (
+                provider_cls is zigpy.ota.providers.ZigpyOtaProvider
+                and CONF_OTA_PROVIDER_CHANNEL not in kwargs
+                and CONF_OTA_PROVIDER_URL not in kwargs
+            ):
+                kwargs[CONF_OTA_PROVIDER_CHANNEL] = ota_channel
 
             return provider_cls(**kwargs)
 

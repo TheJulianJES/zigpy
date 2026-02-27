@@ -115,6 +115,78 @@ async def test_ota_config(tmp_path: pathlib.Path) -> None:
     ]
 
 
+async def test_ota_config_release_channel() -> None:
+    ota = zigpy.ota.OTA(
+        config=config.SCHEMA_OTA(
+            {
+                config.CONF_OTA_ENABLED: True,
+                config.CONF_OTA_BROADCAST_ENABLED: False,
+                config.CONF_OTA_CHANNEL: "beta",
+            }
+        ),
+        application=None,
+    )
+
+    assert ota._providers == [
+        zigpy.ota.providers.ZigpyOtaProvider(channel="beta"),
+        zigpy.ota.providers.Ledvance(),
+        zigpy.ota.providers.Sonoff(),
+        zigpy.ota.providers.Inovelli(),
+        zigpy.ota.providers.ThirdReality(),
+    ]
+
+
+async def test_ota_config_release_channel_does_not_override_provider_channel() -> None:
+    ota = zigpy.ota.OTA(
+        config=config.SCHEMA_OTA(
+            {
+                config.CONF_OTA_ENABLED: True,
+                config.CONF_OTA_BROADCAST_ENABLED: False,
+                config.CONF_OTA_CHANNEL: "beta",
+                config.CONF_OTA_PROVIDERS: [
+                    {
+                        config.CONF_OTA_PROVIDER_TYPE: "zigpy_ota",
+                        config.CONF_OTA_PROVIDER_CHANNEL: "dev",
+                    }
+                ],
+                config.CONF_OTA_EXTRA_PROVIDERS: [],
+            }
+        ),
+        application=None,
+    )
+
+    assert ota._providers == [zigpy.ota.providers.ZigpyOtaProvider(channel="dev")]
+
+
+async def test_ota_config_release_channel_does_not_override_custom_url() -> None:
+    ota = zigpy.ota.OTA(
+        config=config.SCHEMA_OTA(
+            {
+                config.CONF_OTA_ENABLED: True,
+                config.CONF_OTA_BROADCAST_ENABLED: False,
+                config.CONF_OTA_CHANNEL: "beta",
+                config.CONF_OTA_PROVIDERS: [
+                    {
+                        config.CONF_OTA_PROVIDER_TYPE: "zigpy_ota",
+                        config.CONF_OTA_PROVIDER_URL: "https://example.org/version.json",
+                    }
+                ],
+                config.CONF_OTA_EXTRA_PROVIDERS: [],
+            }
+        ),
+        application=None,
+    )
+
+    assert ota._providers == [
+        zigpy.ota.providers.ZigpyOtaProvider(url="https://example.org/version.json")
+    ]
+
+
+async def test_ota_config_invalid_release_channel() -> None:
+    with pytest.raises(vol.Invalid):
+        config.SCHEMA_OTA({config.CONF_OTA_CHANNEL: "nightly"})
+
+
 async def test_ota_config_invalid_message(tmp_path: pathlib.Path) -> None:
     with pytest.raises(vol.Invalid):
         zigpy.ota.OTA(
