@@ -20,6 +20,7 @@ from zigpy.config import (
     CONF_OTA_INOVELLI,
     CONF_OTA_LEDVANCE,
     CONF_OTA_PROVIDER_MANUF_IDS,
+    CONF_OTA_PROVIDER_TYPE,
     CONF_OTA_PROVIDER_URL,
     CONF_OTA_PROVIDERS,
     CONF_OTA_REMOTE_PROVIDERS,
@@ -263,13 +264,32 @@ class OTA:
         # Config gets a little complicated when you mix deprecated config and the new
         # providers config. We treat every option as an "intent" and merge configs in
         # the end.
+        def provider_type(
+            provider_config: dict[str, typing.Any],
+        ) -> type[zigpy.ota.providers.BaseOtaProvider]:
+            provider_cls = provider_config[CONF_OTA_PROVIDER_TYPE]
+            if isinstance(provider_cls, str):
+                return zigpy.ota.providers.OTA_PROVIDER_TYPES[provider_cls]
+
+            return provider_cls
+
+        def instantiate_provider(
+            provider_config: dict[str, typing.Any],
+        ) -> zigpy.ota.providers.BaseOtaProvider:
+            provider_cls = provider_type(provider_config)
+
+            kwargs = dict(provider_config)
+            kwargs.pop(CONF_OTA_PROVIDER_TYPE)
+
+            return provider_cls(**kwargs)
+
         with_providers: list[zigpy.ota.providers.BaseOtaProvider] = [
-            *config[CONF_OTA_PROVIDERS],
-            *config[CONF_OTA_EXTRA_PROVIDERS],
+            *[instantiate_provider(p) for p in config[CONF_OTA_PROVIDERS]],
+            *[instantiate_provider(p) for p in config[CONF_OTA_EXTRA_PROVIDERS]],
         ]
         without_providers: set[type[zigpy.ota.providers.BaseOtaProvider]] = set(
             config[CONF_OTA_DISABLE_DEFAULT_PROVIDERS]
-        ) - {type(p) for p in config[CONF_OTA_EXTRA_PROVIDERS]}
+        ) - {provider_type(p) for p in config[CONF_OTA_EXTRA_PROVIDERS]}
 
         def register_deprecated_provider(
             enabled: bool | str | None,

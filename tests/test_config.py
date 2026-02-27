@@ -8,6 +8,7 @@ import voluptuous as vol
 
 import zigpy.config
 import zigpy.config.validators
+import zigpy.ota.providers
 
 
 @pytest.mark.parametrize(
@@ -164,6 +165,15 @@ def test_schema_network_short_pan_id():
 
     config = zigpy.config.SCHEMA_NETWORK({zigpy.config.CONF_NWK_PAN_ID: 0x1234})
     assert config[zigpy.config.CONF_NWK_PAN_ID].serialize() == b"\x34\x12"
+
+
+def test_schema_ota_provider_configs_are_not_instantiated():
+    """Ensure OTA providers are instantiated by the OTA manager, not config schema."""
+    ota_config = zigpy.config.SCHEMA_OTA({})
+
+    provider_config = ota_config[zigpy.config.CONF_OTA_PROVIDERS][0]
+    assert isinstance(provider_config, dict)
+    assert not isinstance(provider_config, zigpy.ota.providers.BaseOtaProvider)
 
 
 def test_deprecated():

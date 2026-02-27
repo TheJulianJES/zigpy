@@ -120,15 +120,12 @@ def cv_ota_provider_name(name: str | None) -> type[zigpy.ota.providers.BaseOtaPr
     return zigpy.ota.providers.OTA_PROVIDER_TYPES[name]
 
 
-def cv_ota_provider(obj: dict) -> zigpy.ota.providers.BaseOtaProvider:
-    """Validate OTA provider."""
+def cv_ota_provider(obj: dict) -> dict[str, typing.Any]:
+    """Validate OTA provider configuration."""
     provider_type = obj.get(zigpy.config.CONF_OTA_PROVIDER_TYPE)
     provider_cls = cv_ota_provider_name(provider_type)
 
-    kwargs = provider_cls.VOL_SCHEMA(obj)
-    kwargs.pop(zigpy.config.CONF_OTA_PROVIDER_TYPE)
-
-    return provider_cls(**kwargs)
+    return provider_cls.VOL_SCHEMA(obj)
 
 
 def cv_warn_if_greater(limit: int, message: str) -> Callable[[int], int]:
