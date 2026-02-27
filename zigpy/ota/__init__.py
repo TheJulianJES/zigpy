@@ -20,7 +20,6 @@ from zigpy.config import (
     CONF_OTA_IKEA,
     CONF_OTA_INOVELLI,
     CONF_OTA_LEDVANCE,
-    CONF_OTA_PROVIDER_CHANNEL,
     CONF_OTA_PROVIDER_MANUF_IDS,
     CONF_OTA_PROVIDER_TYPE,
     CONF_OTA_PROVIDER_URL,
@@ -285,12 +284,8 @@ class OTA:
             kwargs = dict(provider_config)
             kwargs.pop(CONF_OTA_PROVIDER_TYPE)
 
-            if (
-                provider_cls is zigpy.ota.providers.ZigpyOtaProvider
-                and CONF_OTA_PROVIDER_CHANNEL not in kwargs
-                and CONF_OTA_PROVIDER_URL not in kwargs
-            ):
-                kwargs[CONF_OTA_PROVIDER_CHANNEL] = ota_channel
+            if provider_cls is zigpy.ota.providers.ZigpyOtaProvider:
+                kwargs["default_channel"] = ota_channel
 
             return provider_cls(**kwargs)
 

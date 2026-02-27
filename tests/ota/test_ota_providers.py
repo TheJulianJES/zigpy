@@ -732,6 +732,25 @@ async def test_zigpy_ota_provider():
         mock_http.assert_not_called()
 
 
+async def test_zigpy_ota_provider_default_channel():
+    provider = providers.ZigpyOtaProvider(default_channel="beta")
+    assert provider.channel == "beta"
+    assert provider.url.endswith("/beta.json")
+
+    provider = providers.ZigpyOtaProvider(channel="dev", default_channel="beta")
+    assert provider.channel == "dev"
+    assert provider.url.endswith("/dev.json")
+
+
+async def test_zigpy_ota_provider_default_channel_ignored_for_custom_url():
+    provider = providers.ZigpyOtaProvider(
+        url="https://example.org/custom/version.json",
+        default_channel="beta",
+    )
+    assert provider.url == "https://example.org/custom/version.json"
+    assert provider.channel is None
+
+
 @pytest.mark.parametrize(
     ("channel", "version_file", "url"),
     [
