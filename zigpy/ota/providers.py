@@ -683,7 +683,6 @@ class ZigpyOtaProvider(BaseZigpyProvider):
     NAME = "zigpy_ota"
     VOL_SCHEMA = zigpy.config.SCHEMA_OTA_PROVIDER_ZIGPY_OTA
 
-    DEFAULT_CHANNEL = "stable"
     SUPPORTED_CHANNELS = {"stable", "beta", "dev"}
 
     VERSION_FILE_BASE_URL = (
@@ -700,13 +699,13 @@ class ZigpyOtaProvider(BaseZigpyProvider):
         self,
         url: str | typing.Literal[True] | None = None,
         channel: str | None = None,
-        default_channel: str | None = None,
+        default_channel: str = "stable",
         **kwargs,
     ) -> None:
         # If a specific URL is provided, use it directly (for testing or custom endpoints)
         # Otherwise, construct the version file URL based on the channel
         if url in (True, None):
-            self.channel = channel or default_channel or self.DEFAULT_CHANNEL
+            self.channel = channel or default_channel
             if self.channel not in self.SUPPORTED_CHANNELS:
                 raise ValueError(
                     f"Invalid channel '{self.channel}'. Must be one of: {self.SUPPORTED_CHANNELS}"
