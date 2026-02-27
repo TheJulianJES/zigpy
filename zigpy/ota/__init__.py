@@ -13,6 +13,7 @@ import typing
 from zigpy.config import (
     CONF_OTA_ADVANCED_DIR,
     CONF_OTA_ALLOW_ADVANCED_DIR,
+    CONF_OTA_CHANNEL,
     CONF_OTA_DISABLE_DEFAULT_PROVIDERS,
     CONF_OTA_ENABLED,
     CONF_OTA_EXTRA_PROVIDERS,
@@ -263,9 +264,36 @@ class OTA:
         # Config gets a little complicated when you mix deprecated config and the new
         # providers config. We treat every option as an "intent" and merge configs in
         # the end.
+        ota_channel = config[CONF_OTA_CHANNEL]
+
+        def use_configured_channel(
+            provider: zigpy.ota.providers.BaseOtaProvider,
+        ) -> zigpy.ota.providers.BaseOtaProvider:
+            if not isinstance(provider, zigpy.ota.providers.ZigpyOtaProvider):
+                return provider
+
+            default_channel = zigpy.ota.providers.ZigpyOtaProvider.DEFAULT_CHANNEL
+
+            if provider.channel != default_channel or ota_channel == default_channel:
+                return provider
+
+            default_channel_url = (
+                f"{zigpy.ota.providers.ZigpyOtaProvider.VERSION_FILE_BASE_URL}/"
+                f"{default_channel}.json"
+            )
+
+            if provider.url != default_channel_url:
+                return provider
+
+            return zigpy.ota.providers.ZigpyOtaProvider(
+                channel=ota_channel,
+                manufacturer_ids=list(provider.manufacturer_ids),
+                override_previous=provider.override_previous,
+            )
+
         with_providers: list[zigpy.ota.providers.BaseOtaProvider] = [
-            *config[CONF_OTA_PROVIDERS],
-            *config[CONF_OTA_EXTRA_PROVIDERS],
+            *[use_configured_channel(p) for p in config[CONF_OTA_PROVIDERS]],
+            *[use_configured_channel(p) for p in config[CONF_OTA_EXTRA_PROVIDERS]],
         ]
         without_providers: set[type[zigpy.ota.providers.BaseOtaProvider]] = set(
             config[CONF_OTA_DISABLE_DEFAULT_PROVIDERS]

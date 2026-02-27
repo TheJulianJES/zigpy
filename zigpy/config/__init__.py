@@ -29,6 +29,7 @@ from zigpy.config.defaults import (
     CONF_OTA_BROADCAST_ENABLED_DEFAULT,
     CONF_OTA_BROADCAST_INITIAL_DELAY_DEFAULT,
     CONF_OTA_BROADCAST_INTERVAL_DEFAULT,
+    CONF_OTA_CHANNEL_DEFAULT,
     CONF_OTA_DISABLE_DEFAULT_PROVIDERS_DEFAULT,
     CONF_OTA_ENABLED_DEFAULT,
     CONF_OTA_EXTRA_PROVIDERS_DEFAULT,
@@ -92,7 +93,8 @@ CONF_OTA_BROADCAST_ENABLED = "broadcast_enabled"
 CONF_OTA_BROADCAST_INITIAL_DELAY = "broadcast_initial_delay"
 CONF_OTA_BROADCAST_INTERVAL = "broadcast_interval"
 CONF_OTA_PROVIDER_MANUF_IDS = "manufacturer_ids"
-CONF_OTA_PROVIDER_CHANNEL = "channel"
+CONF_OTA_CHANNEL = "channel"
+CONF_OTA_PROVIDER_CHANNEL = CONF_OTA_CHANNEL
 CONF_SOURCE_ROUTING = "source_routing"
 CONF_STARTUP_ENERGY_SCAN = (
     "startup_energy_scan"  # Unused, kept to avoid breaking imports in dependencies
@@ -257,6 +259,9 @@ SCHEMA_OTA_PROVIDER_REMOTE = vol.Schema(
 
 SCHEMA_OTA_BASE = {
     vol.Optional(CONF_OTA_ENABLED, default=CONF_OTA_ENABLED_DEFAULT): cv_boolean,
+    vol.Optional(CONF_OTA_CHANNEL, default=CONF_OTA_CHANNEL_DEFAULT): vol.In(
+        ["stable", "beta", "dev"]
+    ),
     vol.Optional(
         CONF_OTA_BROADCAST_ENABLED, default=CONF_OTA_BROADCAST_ENABLED_DEFAULT
     ): cv_boolean,
