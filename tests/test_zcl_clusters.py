@@ -211,11 +211,7 @@ async def test_time_cluster():
         status=foundation.Status.SUCCESS,
         value=foundation.TypeValue(
             type=foundation.DataTypeId.map8,
-            value=(
-                Time.TimeStatus.Master
-                | Time.TimeStatus.Synchronized
-                | Time.TimeStatus.Master_for_Zone_and_DST
-            ),
+            value=Time.TimeStatus.Master,
         ),
     )
 
@@ -248,6 +244,96 @@ async def test_time_cluster():
                 status=foundation.Status.UNSUPPORTED_ATTRIBUTE,
             )
         ]
+    )
+
+
+async def test_time_cluster_dst_uses_standard_time_zone_offset():
+    ep = MagicMock()
+    ep.reply = AsyncMock()
+
+    cluster = Time(ep)
+    zigbee_epoch = datetime(2000, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    class PatchedDatetime(datetime):
+        _fake_now = datetime(
+            2000, 6, 1, 0, 0, 0, tzinfo=ZoneInfo("America/Los_Angeles")
+        )
+
+        def astimezone(self):
+            return self.replace(tzinfo=self._fake_now.tzinfo)
+
+        @classmethod
+        def now(cls, tzinfo=None):
+            if tzinfo is None:
+                return cls(
+                    cls._fake_now.year,
+                    cls._fake_now.month,
+                    cls._fake_now.day,
+                    cls._fake_now.hour,
+                    cls._fake_now.minute,
+                    cls._fake_now.second,
+                )
+
+            assert tzinfo is UTC
+            return (
+                cls(
+                    cls._fake_now.year,
+                    cls._fake_now.month,
+                    cls._fake_now.day,
+                    cls._fake_now.hour,
+                    cls._fake_now.minute,
+                    cls._fake_now.second,
+                    tzinfo=tzinfo,
+                )
+                - cls._fake_now.utcoffset()
+            )
+
+    with patch("zigpy.zcl.clusters.general.datetime", PatchedDatetime):
+        rsp = await read_attributes(
+            cluster,
+            [
+                Time.AttributeDefs.time.id,
+                Time.AttributeDefs.time_zone.id,
+                Time.AttributeDefs.local_time.id,
+            ],
+        )
+
+    utc_now = PatchedDatetime._fake_now.astimezone(UTC)
+    current_offset = PatchedDatetime._fake_now.utcoffset()
+    dst_offset = PatchedDatetime._fake_now.dst()
+    assert current_offset is not None
+    assert dst_offset is not None
+
+    expected_time = int((utc_now - zigbee_epoch).total_seconds())
+    expected_standard_offset = int((current_offset - dst_offset).total_seconds())
+    expected_local_time = int((utc_now + current_offset - zigbee_epoch).total_seconds())
+
+    assert rsp.status_records[0] == foundation.ReadAttributeRecord(
+        attrid=Time.AttributeDefs.time.id,
+        status=foundation.Status.SUCCESS,
+        value=foundation.TypeValue(
+            type=foundation.DataTypeId.UTC,
+            value=expected_time,
+        ),
+    )
+
+    assert rsp.status_records[1] == foundation.ReadAttributeRecord(
+        attrid=Time.AttributeDefs.time_zone.id,
+        status=foundation.Status.SUCCESS,
+        value=foundation.TypeValue(
+            type=foundation.DataTypeId.int32,
+            # Standard offset in Los Angeles is UTC-8 even during DST.
+            value=expected_standard_offset,
+        ),
+    )
+
+    assert rsp.status_records[2] == foundation.ReadAttributeRecord(
+        attrid=Time.AttributeDefs.local_time.id,
+        status=foundation.Status.SUCCESS,
+        value=foundation.TypeValue(
+            type=foundation.DataTypeId.uint32,
+            value=expected_local_time,
+        ),
     )
 
 

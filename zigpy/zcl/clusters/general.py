@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Self
 
 import zigpy.types as t
@@ -1133,27 +1133,34 @@ class Time(Cluster):
 
     def handle_read_attribute_time(self) -> t.UTCTime:
         now = datetime.now(UTC)
-        return t.UTCTime((now - ZIGBEE_EPOCH).total_seconds())
+        return t.UTCTime(int((now - ZIGBEE_EPOCH).total_seconds()))
 
     def handle_read_attribute_time_status(self) -> TimeStatus:
-        return (
-            TimeStatus.Master
-            | TimeStatus.Synchronized
-            | TimeStatus.Master_for_Zone_and_DST
-        )
+        # `Synchronized` must be 0 when `Master` is set and we do not expose full
+        # authoritative timezone/DST attributes.
+        return TimeStatus.Master
+
+    @staticmethod
+    def _get_local_utc_offsets() -> tuple[timedelta, timedelta]:
+        local_now = datetime.now().astimezone()
+        utc_offset = local_now.utcoffset()
+        assert utc_offset is not None
+
+        # TimeZone is standard time offset (without DST), local time uses current
+        # offset (including DST if active).
+        dst_offset = local_now.dst() or timedelta(0)
+        standard_offset = utc_offset - dst_offset
+        return standard_offset, utc_offset
 
     def handle_read_attribute_time_zone(self) -> t.int32s:
-        tz_offset = datetime.now().astimezone().utcoffset()
-        assert tz_offset is not None
-
-        return t.int32s(tz_offset.total_seconds())
+        standard_offset, _ = self._get_local_utc_offsets()
+        return t.int32s(int(standard_offset.total_seconds()))
 
     def handle_read_attribute_local_time(self) -> t.LocalTime:
         now = datetime.now(UTC)
-        tz_offset = datetime.now().astimezone().utcoffset()
-        assert tz_offset is not None
+        _, current_offset = self._get_local_utc_offsets()
 
-        return t.LocalTime((now + tz_offset - ZIGBEE_EPOCH).total_seconds())
+        return t.LocalTime(int((now + current_offset - ZIGBEE_EPOCH).total_seconds()))
 
     # For backwards compatibility
     TimeStatus: Final = TimeStatus
