@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Self
 
 import zigpy.types as t
@@ -1153,6 +1153,74 @@ class Time(Cluster):
 
         utc_seconds = (now_local - ZIGBEE_EPOCH).total_seconds()
         return t.LocalTime(utc_seconds + utc_offset.total_seconds())
+
+    def handle_read_attribute_standard_time(self) -> t.StandardTime:
+        now = datetime.now(UTC)
+        now_local = datetime.now().astimezone()
+        utc_offset = now_local.utcoffset()
+        dst = now_local.dst()
+        assert utc_offset is not None and dst is not None
+
+        utc_seconds = (now - ZIGBEE_EPOCH).total_seconds()
+        return t.StandardTime(utc_seconds + (utc_offset - dst).total_seconds())
+
+    def handle_read_attribute_dst_shift(self) -> t.int32s:
+        now_local = datetime.now().astimezone()
+        dst = now_local.dst()
+        assert dst is not None
+
+        return t.int32s(dst.total_seconds())
+
+    def handle_read_attribute_dst_start(self) -> t.uint32_t:
+        dst_start, _ = self._find_year_dst_transitions()
+        return t.uint32_t(dst_start if dst_start is not None else 0xFFFFFFFF)
+
+    def handle_read_attribute_dst_end(self) -> t.uint32_t:
+        _, dst_end = self._find_year_dst_transitions()
+        return t.uint32_t(dst_end if dst_end is not None else 0xFFFFFFFF)
+
+    def _find_year_dst_transitions(self) -> tuple[int | None, int | None]:
+        """Find DST start and end for the current year as Zigbee UTC seconds."""
+        now_local = datetime.now().astimezone()
+        tz = now_local.tzinfo
+        year = now_local.year
+
+        one_day = timedelta(days=1)
+        current_utc = datetime(year, 1, 1, 0, 0, 0, tzinfo=UTC)
+        end_utc = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+        prev_dst = current_utc.astimezone(tz).dst()
+        dst_start = None
+        dst_end = None
+
+        while current_utc < end_utc:
+            next_utc = current_utc + one_day
+            curr_dst = next_utc.astimezone(tz).dst()
+
+            if curr_dst != prev_dst:
+                # Binary search for exact transition point
+                lo, hi = current_utc, next_utc
+
+                while (hi - lo).total_seconds() > 1:
+                    mid = lo + (hi - lo) / 2
+
+                    if mid.astimezone(tz).dst() == lo.astimezone(tz).dst():
+                        lo = mid
+                    else:
+                        hi = mid
+
+                zigbee_seconds = int((hi - ZIGBEE_EPOCH).total_seconds())
+                entering_dst = curr_dst is not None and curr_dst > timedelta(0)
+
+                if entering_dst:
+                    dst_start = zigbee_seconds
+                else:
+                    dst_end = zigbee_seconds
+
+            prev_dst = curr_dst
+            current_utc = next_utc
+
+        return dst_start, dst_end
 
     # For backwards compatibility
     TimeStatus: Final = TimeStatus
