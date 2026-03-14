@@ -143,8 +143,16 @@ def _make_patched_datetime(fake_now):
     class PatchedDatetime(datetime):
         _fake_now = fake_now
 
-        def astimezone(self):
-            return self.replace(tzinfo=self._fake_now.tzinfo)
+        def astimezone(self, tz=None):
+            if tz is None:
+                tz = self._fake_now.tzinfo
+
+            if self.tzinfo is None:
+                # Naive datetime from now() - localize as local time
+                return self.replace(tzinfo=tz)
+
+            # Timezone-aware datetime - perform real conversion
+            return super().astimezone(tz)
 
         @classmethod
         def now(cls, tzinfo=None):
@@ -176,7 +184,16 @@ def _make_patched_datetime(fake_now):
 
 
 @pytest.mark.parametrize(
-    ("fake_now", "expected_utc", "expected_tz", "expected_local"),
+    (
+        "fake_now",
+        "expected_utc",
+        "expected_tz",
+        "expected_local",
+        "expected_standard",
+        "expected_dst_shift",
+        "expected_dst_start",
+        "expected_dst_end",
+    ),
     [
         pytest.param(
             # January: PST (UTC-8), no DST
@@ -187,6 +204,14 @@ def _make_patched_datetime(fake_now):
             -(8 * 60 * 60),
             # Local time: midnight Jan 2 = 1 day from epoch
             24 * 60 * 60,
+            # Standard time = UTC time + timezone = same as local (no DST)
+            24 * 60 * 60,
+            # DST shift: 0 (no DST in January)
+            0,
+            # DST start: Apr 2, 2000 10:00 UTC (2 AM PST -> 3 AM PDT)
+            7984800,
+            # DST end: Oct 29, 2000 09:00 UTC (2 AM PDT -> 1 AM PST)
+            26125200,
             id="winter_no_dst",
         ),
         pytest.param(
@@ -198,11 +223,27 @@ def _make_patched_datetime(fake_now):
             -(8 * 60 * 60),
             # Local time: midnight Jul 2 local
             183 * 24 * 60 * 60,
+            # Standard time = UTC time + timezone = 23:00 Jul 1 (1 hour behind local)
+            183 * 24 * 60 * 60 - 60 * 60,
+            # DST shift: 1 hour
+            60 * 60,
+            # Same DST transitions as winter (same year, same timezone)
+            7984800,
+            26125200,
             id="summer_with_dst",
         ),
     ],
 )
-async def test_time_cluster(fake_now, expected_utc, expected_tz, expected_local):
+async def test_time_cluster(
+    fake_now,
+    expected_utc,
+    expected_tz,
+    expected_local,
+    expected_standard,
+    expected_dst_shift,
+    expected_dst_start,
+    expected_dst_end,
+):
     ep = MagicMock()
     ep.reply = AsyncMock()
 
@@ -215,7 +256,6 @@ async def test_time_cluster(fake_now, expected_utc, expected_tz, expected_local)
     PatchedDatetime = _make_patched_datetime(fake_now)
 
     with patch("zigpy.zcl.clusters.general.datetime", PatchedDatetime):
-        # Supported attributes
         rsp1 = await read_attributes(
             cluster,
             [
@@ -223,6 +263,10 @@ async def test_time_cluster(fake_now, expected_utc, expected_tz, expected_local)
                 Time.AttributeDefs.time_status.id,
                 Time.AttributeDefs.time_zone.id,
                 Time.AttributeDefs.local_time.id,
+                Time.AttributeDefs.standard_time.id,
+                Time.AttributeDefs.dst_shift.id,
+                Time.AttributeDefs.dst_start.id,
+                Time.AttributeDefs.dst_end.id,
             ],
         )
 
@@ -261,6 +305,52 @@ async def test_time_cluster(fake_now, expected_utc, expected_tz, expected_local)
             value=expected_local,
         ),
     )
+
+    assert rsp1.status_records[4] == foundation.ReadAttributeRecord(
+        attrid=Time.AttributeDefs.standard_time.id,
+        status=foundation.Status.SUCCESS,
+        value=foundation.TypeValue(
+            type=foundation.DataTypeId.uint32,
+            value=expected_standard,
+        ),
+    )
+
+    assert rsp1.status_records[5] == foundation.ReadAttributeRecord(
+        attrid=Time.AttributeDefs.dst_shift.id,
+        status=foundation.Status.SUCCESS,
+        value=foundation.TypeValue(
+            type=foundation.DataTypeId.int32,
+            value=expected_dst_shift,
+        ),
+    )
+
+    assert rsp1.status_records[6] == foundation.ReadAttributeRecord(
+        attrid=Time.AttributeDefs.dst_start.id,
+        status=foundation.Status.SUCCESS,
+        value=foundation.TypeValue(
+            type=foundation.DataTypeId.uint32,
+            value=expected_dst_start,
+        ),
+    )
+
+    assert rsp1.status_records[7] == foundation.ReadAttributeRecord(
+        attrid=Time.AttributeDefs.dst_end.id,
+        status=foundation.Status.SUCCESS,
+        value=foundation.TypeValue(
+            type=foundation.DataTypeId.uint32,
+            value=expected_dst_end,
+        ),
+    )
+
+    # Verify spec invariants
+    if expected_dst_shift > 0:
+        # DST active: local = standard + dst_shift
+        assert expected_local == expected_standard + expected_dst_shift
+        assert expected_dst_start <= expected_utc <= expected_dst_end
+    else:
+        # No DST: local = standard
+        assert expected_local == expected_standard
+        assert expected_utc < expected_dst_start or expected_utc > expected_dst_end
 
     # Unsupported
     rsp2 = await read_attributes(cluster, [0xABCD])
