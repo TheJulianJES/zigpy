@@ -954,15 +954,23 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
         )
 
         # Prompt device to send QueryNextImage with updated version for query cache
+        await self._refresh_ota_query_cache(
+            ota, failure_message="Post-OTA image_notify failed"
+        )
+
+        return result
+
+    async def _refresh_ota_query_cache(
+        self, ota_cluster: Ota, *, failure_message: str
+    ) -> None:
+        """Best-effort prompt for a device to refresh its cached OTA query info."""
         try:
-            await ota.image_notify(
+            await ota_cluster.image_notify(
                 payload_type=Ota.ImageNotifyCommand.PayloadType.QueryJitter,
                 query_jitter=100,
             )
         except Exception:  # noqa: BLE001
-            self.debug("Post-OTA image_notify failed", exc_info=True)
-
-        return result
+            self.debug(failure_message, exc_info=True)
 
     def get_last_ota_query_cmd(self) -> QueryNextImageCommand | None:
         """Return the last cached QueryNextImageCommand, preferring client clusters."""
