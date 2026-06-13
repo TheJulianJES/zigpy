@@ -190,6 +190,71 @@ class SignedIkeaRemoteOtaImageMetadata(IkeaRemoteOtaImageMetadata):
                 raise ValueError(f"Block {block_num} has invalid checksum")
 
 
+# Metadata types that can be persisted to and restored from the database. Only
+# types yielded by trusted providers need to be listed.
+PERSISTABLE_METADATA_TYPES: dict[str, type[BaseOtaImageMetadata]] = {
+    "remote": RemoteOtaImageMetadata,
+    "local": LocalOtaImageMetadata,
+}
+
+# Metadata fields that are not JSON-serializable and have safe defaults
+_METADATA_EXCLUDED_FIELDS = frozenset({"ssl_ctx"})
+_METADATA_TUPLE_FIELDS = frozenset({"manufacturer_names", "model_names"})
+
+
+def serialize_image_metadata(meta: BaseOtaImageMetadata) -> dict | None:
+    """Serialize image metadata into a JSON-compatible dict, if possible."""
+    for type_tag, cls in PERSISTABLE_METADATA_TYPES.items():
+        if type(meta) is cls:
+            break
+    else:
+        return None
+
+    obj: dict[str, typing.Any] = {"type": type_tag}
+
+    for field in attrs.fields(cls):
+        if field.name in _METADATA_EXCLUDED_FIELDS:
+            continue
+
+        value = getattr(meta, field.name)
+
+        if isinstance(value, pathlib.Path):
+            value = str(value)
+        elif isinstance(value, tuple):
+            value = list(value)
+
+        obj[field.name] = value
+
+    return obj
+
+
+def deserialize_image_metadata(obj: typing.Any) -> BaseOtaImageMetadata | None:
+    """Deserialize image metadata from a dict, dropping invalid objects."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("type"), str):
+        return None
+
+    cls = PERSISTABLE_METADATA_TYPES.get(obj["type"])
+    if cls is None:
+        return None
+
+    field_names = {f.name for f in attrs.fields(cls)} - _METADATA_EXCLUDED_FIELDS
+
+    # Unknown fields (e.g. written by a future zigpy version) are dropped
+    kwargs = {k: v for k, v in obj.items() if k in field_names}
+
+    for name in _METADATA_TUPLE_FIELDS:
+        if isinstance(kwargs.get(name), list):
+            kwargs[name] = tuple(kwargs[name])
+
+    if isinstance(kwargs.get("path"), str):
+        kwargs["path"] = pathlib.Path(kwargs["path"])
+
+    try:
+        return cls(**kwargs)
+    except (TypeError, ValueError):
+        return None
+
+
 class BaseOtaProvider:
     NAME: str
     MANUFACTURER_IDS: tuple[int, ...] = ()
