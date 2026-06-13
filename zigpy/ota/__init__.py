@@ -10,6 +10,7 @@ import dataclasses
 import datetime
 import hashlib
 import logging
+import random
 import typing
 
 from zigpy.config import (
@@ -46,6 +47,14 @@ _LOGGER = logging.getLogger(__name__)
 OTA_FETCH_TIMEOUT = 20
 MAX_DEVICES_CHECKING_IN_PER_BROADCAST = 15
 BROADCAST_SETTLE_DELAY = 60
+
+# How long after startup indexes restored from the database are refreshed.
+# Users expect a restart to eventually pick up new firmware, but refreshing
+# immediately would defeat the index rate limiting on every restart. The delay
+# is randomized per provider so a fleet of instances restarting simultaneously
+# (e.g. after a Home Assistant update) does not hit the index servers at once.
+POST_RESTORE_REFRESH_DELAY_MIN = datetime.timedelta(minutes=10)
+POST_RESTORE_REFRESH_DELAY_MAX = datetime.timedelta(minutes=30)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -246,6 +255,7 @@ class OTA:
         ] = {}
 
         self._broadcast_loop_task = None
+        self._post_restore_refresh_task: asyncio.Task | None = None
 
         if config[CONF_OTA_ENABLED]:
             self._register_providers(self._config)
@@ -287,6 +297,10 @@ class OTA:
         if self._broadcast_loop_task is not None:
             self._broadcast_loop_task.cancel()
             self._broadcast_loop_task = None
+
+        if self._post_restore_refresh_task is not None:
+            self._post_restore_refresh_task.cancel()
+            self._post_restore_refresh_task = None
 
     def invalidate_provider_caches(self) -> None:
         """Invalidate all provider index caches, forcing a refresh on next check.
@@ -510,6 +524,98 @@ class OTA:
         # Replace the provider's images wholesale so images withdrawn from the
         # index are revoked
         self._image_cache[provider] = new_images
+
+        if provider.TRUSTED:
+            self._persist_provider_index(provider, new_images)
+
+    def _persist_provider_index(
+        self,
+        provider: zigpy.ota.providers.BaseOtaProvider,
+        images: dict[zigpy.ota.providers.BaseOtaImageMetadata, OtaImageWithMetadata],
+    ) -> None:
+        """Notify listeners (i.e. the database) of a trusted provider's new index."""
+        if self._application is None:
+            return
+
+        index = [
+            obj
+            for obj in (
+                zigpy.ota.providers.serialize_image_metadata(meta) for meta in images
+            )
+            if obj is not None
+        ]
+
+        self._application.listener_event(
+            "ota_provider_index_updated",
+            repr(provider),
+            provider._index_last_updated,
+            index,
+        )
+
+    def restore_cached_index(
+        self,
+        provider_id: str,
+        last_updated: datetime.datetime,
+        metadata: list[zigpy.ota.providers.BaseOtaImageMetadata],
+    ) -> bool:
+        """Restore a trusted provider's index cache from the database.
+
+        Returns whether a registered trusted provider matched the persisted
+        identity. Restored indexes are refreshed shortly after startup, or on
+        the first device check if the persisted index already expired.
+        """
+        provider = next(
+            (p for p in self._providers if p.TRUSTED and repr(p) == provider_id),
+            None,
+        )
+
+        if provider is None:
+            return False
+
+        if provider in self._image_cache:
+            # The provider has already loaded a live index
+            return True
+
+        images: dict[
+            zigpy.ota.providers.BaseOtaImageMetadata, OtaImageWithMetadata
+        ] = {}
+
+        for meta in metadata:
+            if not meta.trusted:
+                meta = meta.replace(trusted=True)
+
+            images.setdefault(meta, OtaImageWithMetadata(metadata=meta, firmware=None))
+
+        self._image_cache[provider] = images
+
+        # Cap the restored freshness so the index expires (and is refreshed)
+        # shortly after startup instead of inheriting the full remaining TTL
+        now = datetime.datetime.now(datetime.UTC)
+        refresh_delay = datetime.timedelta(
+            seconds=random.uniform(  # noqa: S311
+                POST_RESTORE_REFRESH_DELAY_MIN.total_seconds(),
+                POST_RESTORE_REFRESH_DELAY_MAX.total_seconds(),
+            )
+        )
+        provider._index_last_updated = min(
+            last_updated,
+            now + refresh_delay - provider.INDEX_EXPIRATION_TIME,
+        )
+
+        # Re-check all devices once every restored index has expired
+        if self._post_restore_refresh_task is None:
+            self._post_restore_refresh_task = asyncio.create_task(
+                self._post_restore_refresh(
+                    POST_RESTORE_REFRESH_DELAY_MAX.total_seconds() + 1
+                )
+            )
+
+        return True
+
+    async def _post_restore_refresh(self, delay: float) -> None:
+        """Refresh the restored indexes and re-check all devices."""
+        await asyncio.sleep(delay)
+        await self.check_all_devices_for_ota()
 
     @zigpy.util.combine_concurrent_calls
     async def _fetch_image(self, image: OtaImageWithMetadata) -> OtaImageWithMetadata:
