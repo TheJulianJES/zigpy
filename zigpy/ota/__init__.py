@@ -56,6 +56,10 @@ BROADCAST_SETTLE_DELAY = 60
 POST_RESTORE_REFRESH_DELAY_MIN = datetime.timedelta(minutes=10)
 POST_RESTORE_REFRESH_DELAY_MAX = datetime.timedelta(minutes=30)
 
+# Size limit for the downloaded firmware cache. Firmware is re-downloaded on
+# demand if it is evicted, so the limit only trades memory for bandwidth.
+FIRMWARE_CACHE_SIZE_LIMIT = 32 * 1024 * 1024  # bytes
+
 
 @dataclasses.dataclass(frozen=True)
 class OtaImagesResult(t.BaseDataclassMixin):
@@ -669,7 +673,16 @@ class OTA:
         self, metadata: zigpy.ota.providers.BaseOtaImageMetadata
     ) -> BaseOTAImage | None:
         """Look up downloaded firmware for the given metadata."""
-        return self._firmware_cache.get(metadata.firmware_cache_key)
+        key = metadata.firmware_cache_key
+        firmware = self._firmware_cache.pop(key, None)
+
+        if firmware is None:
+            return None
+
+        # Re-insert to mark the firmware as most-recently-used
+        self._firmware_cache[key] = firmware
+
+        return firmware
 
     def _store_firmware(
         self,
@@ -678,7 +691,22 @@ class OTA:
     ) -> None:
         """Cache downloaded firmware for the given metadata."""
         _LOGGER.debug("Caching firmware for %s", metadata)
-        self._firmware_cache[metadata.firmware_cache_key] = firmware
+        key = metadata.firmware_cache_key
+        self._firmware_cache.pop(key, None)
+        self._firmware_cache[key] = firmware
+
+        # Evict the least-recently-used firmware once the cache grows beyond
+        # the size limit, always keeping at least the newest entry
+        while (
+            len(self._firmware_cache) > 1
+            and sum(fw.header.image_size for fw in self._firmware_cache.values())
+            > FIRMWARE_CACHE_SIZE_LIMIT
+        ):
+            evicted_key = next(iter(self._firmware_cache))
+            _LOGGER.debug(
+                "Evicting cached firmware over the size limit: %s", evicted_key
+            )
+            del self._firmware_cache[evicted_key]
 
     @zigpy.util.combine_concurrent_calls
     async def _fetch_firmware(

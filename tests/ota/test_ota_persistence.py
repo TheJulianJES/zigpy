@@ -111,6 +111,7 @@ def test_metadata_serialization_roundtrip_local(tmp_path: pathlib.Path) -> None:
     restored = deserialize_image_metadata(json.loads(json.dumps(obj)))
     assert restored == meta
     assert isinstance(restored.path, pathlib.Path)
+    assert restored.firmware_cache_key == meta.firmware_cache_key
 
 
 def test_metadata_serialization_unknown_type() -> None:
@@ -408,3 +409,55 @@ async def test_firmware_downloaded_once_for_shared_fetch_identity(query_cmd) -> 
     assert all(img.firmware is not None for img in images.upgrades)
     assert len(fetch.mock_calls) == 1
     assert len(ota._firmware_cache) == 1
+
+
+def test_firmware_cache_size_limit(query_cmd) -> None:
+    """The firmware cache evicts least-recently-used entries over the limit."""
+    ota = zigpy.ota.OTA(config={config.CONF_OTA_ENABLED: False}, application=None)
+
+    def make_image(version: int) -> zigpy.ota.image.OTAImage:
+        # Each image's header reports an image size of 70 bytes
+        return zigpy.ota.image.OTAImage(
+            header=zigpy.ota.image.OTAImageHeader(
+                upgrade_file_id=zigpy.ota.image.OTAImageHeader.MAGIC_VALUE,
+                file_version=version,
+                image_type=0xABCD,
+                manufacturer_id=0x1234,
+                header_version=256,
+                header_length=56,
+                field_control=0,
+                stack_version=2,
+                header_string="This is a test header!",
+                image_size=56 + 2 + 4 + 8,
+            ),
+            subelements=[zigpy.ota.image.SubElement(tag_id=0x0000, data=b"fw_image")],
+        )
+
+    def make_meta(version: int) -> RemoteOtaImageMetadata:
+        return RemoteOtaImageMetadata(
+            file_version=version, url=f"https://example.org/fw_{version}.ota"
+        )
+
+    metas = {version: make_meta(version) for version in (1, 2, 3)}
+    images = {version: make_image(version) for version in (1, 2, 3)}
+
+    # Two 70 byte images fit under the limit
+    with patch.object(zigpy.ota, "FIRMWARE_CACHE_SIZE_LIMIT", 150):
+        ota._store_firmware(metas[1], images[1])
+        ota._store_firmware(metas[2], images[2])
+        assert len(ota._firmware_cache) == 2
+
+        # Touch the first image so the second becomes least-recently-used
+        assert ota._get_cached_firmware(metas[1]) is images[1]
+
+        # Storing a third image evicts the second
+        ota._store_firmware(metas[3], images[3])
+        assert ota._get_cached_firmware(metas[1]) is images[1]
+        assert ota._get_cached_firmware(metas[2]) is None
+        assert ota._get_cached_firmware(metas[3]) is images[3]
+
+    # An entry over the limit by itself is still cached
+    with patch.object(zigpy.ota, "FIRMWARE_CACHE_SIZE_LIMIT", 10):
+        ota._store_firmware(metas[1], images[1])
+        assert ota._get_cached_firmware(metas[1]) is images[1]
+        assert len(ota._firmware_cache) == 1
