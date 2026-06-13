@@ -1868,9 +1868,7 @@ async def test_ota_provider_index_cache_persistence(tmp_path):
     app2 = await make_app_with_ota_db(db)
     provider2 = next(p for p in app2.ota._providers if p.TRUSTED)
 
-    assert app2.ota._image_cache[provider2] == {
-        meta: zigpy.ota.OtaImageWithMetadata(metadata=meta, firmware=None)
-    }
+    assert app2.ota._image_cache[provider2] == {meta}
     # The restored freshness is at most the persisted timestamp
     assert provider2._index_last_updated <= last_updated
     # The post-restore refresh task is cancelled at shutdown
@@ -1932,5 +1930,5 @@ async def test_ota_provider_index_cache_kept_when_ota_disabled(tmp_path):
 
     app3 = await make_app_with_ota_db(db)
     provider3 = next(p for p in app3.ota._providers if p.TRUSTED)
-    assert app3.ota._image_cache[provider3] == {}
+    assert app3.ota._image_cache[provider3] == set()
     await app3.shutdown()

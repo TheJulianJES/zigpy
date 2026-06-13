@@ -883,8 +883,7 @@ async def test_invalidate_provider_caches_revokes_withdrawn_images(
     result1 = await ota.get_ota_images(device, query_cmd)
     assert len(result1.upgrades) == 2
 
-    cached_kept = ota._image_cache[provider][meta_kept]
-    assert cached_kept.firmware is not None
+    kept_firmware = ota._firmware_cache[meta_kept.firmware_cache_key]
 
     # Provider now only serves the first image (the other was withdrawn)
     provider._index = [meta_kept]
@@ -895,8 +894,9 @@ async def test_invalidate_provider_caches_revokes_withdrawn_images(
     assert len(result2.upgrades) == 1
     assert result2.upgrades[0].metadata == meta_kept
 
-    # The already-downloaded firmware was carried over, not re-downloaded
-    assert ota._image_cache[provider][meta_kept] is cached_kept
+    # The already-downloaded firmware was kept, the withdrawn one's was dropped
+    assert ota._firmware_cache[meta_kept.firmware_cache_key] is kept_firmware
+    assert meta_withdrawn.firmware_cache_key not in ota._firmware_cache
 
 
 async def test_ota_index_refresh_revokes_withdrawn_images(
@@ -929,8 +929,7 @@ async def test_ota_index_refresh_revokes_withdrawn_images(
     images1 = await ota.get_ota_images(device, query_cmd)
     assert len(images1.upgrades) == 2
 
-    cached_kept = ota._image_cache[provider][meta_kept]
-    assert cached_kept.firmware is not None
+    kept_firmware = ota._firmware_cache[meta_kept.firmware_cache_key]
 
     # The newest image is pulled from the index, which then expires
     provider._index = [meta_kept]
@@ -940,8 +939,9 @@ async def test_ota_index_refresh_revokes_withdrawn_images(
     assert len(images2.upgrades) == 1
     assert images2.upgrades[0].metadata == meta_kept
 
-    # The already-downloaded firmware was carried over, not re-downloaded
-    assert ota._image_cache[provider][meta_kept] is cached_kept
+    # The already-downloaded firmware was kept, the withdrawn one's was dropped
+    assert ota._firmware_cache[meta_kept.firmware_cache_key] is kept_firmware
+    assert meta_withdrawn.firmware_cache_key not in ota._firmware_cache
 
 
 async def test_ota_index_refresh_failure_keeps_cached_images(

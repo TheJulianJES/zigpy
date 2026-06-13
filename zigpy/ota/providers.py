@@ -124,6 +124,17 @@ class BaseOtaImageMetadata(t.BaseDataclassMixin):
         image, _ = parse_ota_image(data)
         return image
 
+    @property
+    def firmware_cache_key(self) -> typing.Hashable:
+        """Key identifying the validated firmware bytes this metadata fetches.
+
+        Two metadata objects with the same key fetch and validate identical
+        firmware, even if cosmetic fields (e.g. release notes) differ.
+        Metadata without distinguishing fetch fields conservatively uses the
+        metadata object itself as the key.
+        """
+        return self
+
 
 @attrs.define(frozen=True, kw_only=True)
 class RemoteOtaImageMetadata(BaseOtaImageMetadata):
@@ -137,6 +148,10 @@ class RemoteOtaImageMetadata(BaseOtaImageMetadata):
             async with req.get(self.url, ssl=self.ssl_ctx) as rsp:
                 return await rsp.read()
 
+    @property
+    def firmware_cache_key(self) -> typing.Hashable:
+        return (type(self), self.url, self.file_version, self.checksum, self.file_size)
+
 
 @attrs.define(frozen=True, kw_only=True)
 class LocalOtaImageMetadata(BaseOtaImageMetadata):
@@ -145,6 +160,16 @@ class LocalOtaImageMetadata(BaseOtaImageMetadata):
     async def _fetch(self) -> bytes:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.path.read_bytes)
+
+    @property
+    def firmware_cache_key(self) -> typing.Hashable:
+        return (
+            type(self),
+            self.path,
+            self.file_version,
+            self.checksum,
+            self.file_size,
+        )
 
 
 @attrs.define(frozen=True, kw_only=True)

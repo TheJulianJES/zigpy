@@ -249,10 +249,15 @@ class OTA:
         self._application = application
 
         self._providers: list[zigpy.ota.providers.BaseOtaProvider] = []
+        # Per-provider index metadata, replaced wholesale on every refresh
         self._image_cache: dict[
             zigpy.ota.providers.BaseOtaProvider,
-            dict[zigpy.ota.providers.BaseOtaImageMetadata, OtaImageWithMetadata],
+            set[zigpy.ota.providers.BaseOtaImageMetadata],
         ] = {}
+        # Downloaded firmware, keyed by fetch identity. This is a pure cache:
+        # images are only ever served through the index metadata above, so an
+        # unreferenced blob is unreachable and any eviction is safe.
+        self._firmware_cache: dict[typing.Hashable, BaseOTAImage] = {}
 
         self._broadcast_loop_task = None
         self._post_restore_refresh_task: asyncio.Task | None = None
@@ -305,9 +310,9 @@ class OTA:
     def invalidate_provider_caches(self) -> None:
         """Invalidate all provider index caches, forcing a refresh on next check.
 
-        The refresh revokes images withdrawn from the new indexes.
-        Already-downloaded firmware is carried over for images whose metadata
-        is unchanged and is otherwise re-downloaded.
+        The refresh revokes images withdrawn from the new indexes, dropping
+        their downloaded firmware. Firmware of images still being served is
+        kept, even if cosmetic metadata (e.g. release notes) changed.
         """
         for provider in self._providers:
             provider.invalidate_index()
@@ -501,10 +506,7 @@ class OTA:
 
         _LOGGER.debug("Loaded %d images from provider: %s", len(index), provider)
 
-        old_images = self._image_cache.get(provider, {})
-        new_images: dict[
-            zigpy.ota.providers.BaseOtaImageMetadata, OtaImageWithMetadata
-        ] = {}
+        new_index: set[zigpy.ota.providers.BaseOtaImageMetadata] = set()
 
         for meta in index:
             # Mark metadata as trusted if it comes from a trusted provider
@@ -522,27 +524,20 @@ class OTA:
                 )
                 continue
 
-            if meta in new_images:
-                continue
+            new_index.add(meta)
 
-            # Carry over already-downloaded firmware for unchanged metadata
-            cached = old_images.get(meta)
-            if cached is None or cached.firmware is None:
-                cached = OtaImageWithMetadata(metadata=meta, firmware=None)
-
-            new_images[meta] = cached
-
-        # Replace the provider's images wholesale so images withdrawn from the
-        # index are revoked
-        self._image_cache[provider] = new_images
+        # Replace the provider's index wholesale so images withdrawn from the
+        # index are revoked, then drop firmware nothing references anymore
+        self._image_cache[provider] = new_index
+        self._prune_firmware_cache()
 
         if provider.TRUSTED:
-            self._persist_provider_index(provider, new_images)
+            self._persist_provider_index(provider, new_index)
 
     def _persist_provider_index(
         self,
         provider: zigpy.ota.providers.BaseOtaProvider,
-        images: dict[zigpy.ota.providers.BaseOtaImageMetadata, OtaImageWithMetadata],
+        metadata: set[zigpy.ota.providers.BaseOtaImageMetadata],
     ) -> None:
         """Notify listeners (i.e. the database) of a trusted provider's new index."""
         if self._application is None:
@@ -551,7 +546,7 @@ class OTA:
         index = [
             obj
             for obj in (
-                zigpy.ota.providers.serialize_image_metadata(meta) for meta in images
+                zigpy.ota.providers.serialize_image_metadata(meta) for meta in metadata
             )
             if obj is not None
         ]
@@ -587,15 +582,13 @@ class OTA:
             # The provider has already loaded a live index
             return True
 
-        images: dict[
-            zigpy.ota.providers.BaseOtaImageMetadata, OtaImageWithMetadata
-        ] = {}
+        images: set[zigpy.ota.providers.BaseOtaImageMetadata] = set()
 
         for meta in metadata:
             if not meta.trusted:
                 meta = meta.replace(trusted=True)
 
-            images.setdefault(meta, OtaImageWithMetadata(metadata=meta, firmware=None))
+            images.add(meta)
 
         self._image_cache[provider] = images
 
@@ -657,13 +650,44 @@ class OTA:
             len(images),
         )
         del self._image_cache[provider]
+        self._prune_firmware_cache()
+
+    def _prune_firmware_cache(self) -> None:
+        """Drop downloaded firmware no longer referenced by any provider index."""
+        live_keys = {
+            meta.firmware_cache_key
+            for index in self._image_cache.values()
+            for meta in index
+        }
+
+        for key in list(self._firmware_cache):
+            if key not in live_keys:
+                _LOGGER.debug("Dropping unreferenced cached firmware: %s", key)
+                del self._firmware_cache[key]
+
+    def _get_cached_firmware(
+        self, metadata: zigpy.ota.providers.BaseOtaImageMetadata
+    ) -> BaseOTAImage | None:
+        """Look up downloaded firmware for the given metadata."""
+        return self._firmware_cache.get(metadata.firmware_cache_key)
+
+    def _store_firmware(
+        self,
+        metadata: zigpy.ota.providers.BaseOtaImageMetadata,
+        firmware: BaseOTAImage,
+    ) -> None:
+        """Cache downloaded firmware for the given metadata."""
+        _LOGGER.debug("Caching firmware for %s", metadata)
+        self._firmware_cache[metadata.firmware_cache_key] = firmware
 
     @zigpy.util.combine_concurrent_calls
-    async def _fetch_image(self, image: OtaImageWithMetadata) -> OtaImageWithMetadata:
-        """Fetch an OTA image."""
+    async def _fetch_firmware(
+        self, metadata: zigpy.ota.providers.BaseOtaImageMetadata
+    ) -> BaseOTAImage:
+        """Download and validate an OTA image."""
 
         async with asyncio_timeout(OTA_FETCH_TIMEOUT):
-            return await image.fetch()
+            return await metadata.fetch()
 
     async def get_ota_images(
         self,
@@ -682,23 +706,12 @@ class OTA:
             *(self._refresh_provider_index(p) for p in compatible_providers)
         )
 
-        # Merge the cached images of all compatible providers. The same metadata can
-        # be served by multiple providers so prefer entries with downloaded firmware.
-        images: dict[
-            zigpy.ota.providers.BaseOtaImageMetadata, OtaImageWithMetadata
-        ] = {}
-        image_providers: dict[
-            zigpy.ota.providers.BaseOtaImageMetadata,
-            zigpy.ota.providers.BaseOtaProvider,
-        ] = {}
+        # Merge the cached index metadata of all compatible providers and pair
+        # each image with its downloaded firmware, if any
+        metadata: set[zigpy.ota.providers.BaseOtaImageMetadata] = set()
 
         for provider in compatible_providers:
-            for meta, img in self._image_cache.get(provider, {}).items():
-                if meta not in images or (
-                    images[meta].firmware is None and img.firmware is not None
-                ):
-                    images[meta] = img
-                    image_providers[meta] = provider
+            metadata |= self._image_cache.get(provider, set())
 
         # Find all superficially compatible images. Note that if an image's contents
         # are unknown and its metadata does not describe hardware compatibility, we will
@@ -706,7 +719,12 @@ class OTA:
         candidates = sorted(
             [
                 img
-                for img in images.values()
+                for img in (
+                    OtaImageWithMetadata(
+                        metadata=meta, firmware=self._get_cached_firmware(meta)
+                    )
+                    for meta in metadata
+                )
                 if img.check_compatibility(device, query_cmd)
             ],
             key=lambda img: img.version,
@@ -722,47 +740,45 @@ class OTA:
         }
 
         # Only download upgrade images from untrusted providers; trusted providers have
-        # complete metadata so we can defer the download until install time
-        undownloaded_images = [
-            img
-            for img in upgrades.values()
-            if img.firmware is None and not img.metadata.trusted
-        ]
+        # complete metadata so we can defer the download until install time. Images
+        # sharing a fetch identity (e.g. differing only in release notes) are
+        # downloaded once.
+        undownloaded: dict[typing.Hashable, list[OtaImageWithMetadata]] = {}
+
+        for img in upgrades.values():
+            if img.firmware is None and not img.metadata.trusted:
+                undownloaded.setdefault(img.metadata.firmware_cache_key, []).append(img)
 
         # Fetch all the candidates that are missing from the cache
         results = await asyncio.gather(
-            *(self._fetch_image(img) for img in undownloaded_images),
+            *(
+                self._fetch_firmware(group[0].metadata)
+                for group in undownloaded.values()
+            ),
             return_exceptions=True,
         )
 
-        for img, result in zip(undownloaded_images, results, strict=True):
+        for group, result in zip(undownloaded.values(), results, strict=True):
             if isinstance(result, BaseException):
                 _LOGGER.debug(
-                    "Failed to download image, ignoring: %s", img, exc_info=result
+                    "Failed to download image, ignoring: %s",
+                    group[0].metadata,
+                    exc_info=result,
                 )
-                upgrades.pop(img.metadata)
+                for img in group:
+                    upgrades.pop(img.metadata)
                 continue
 
-            # `img` is the metadata without downloaded firmware. `result` is the same
-            # image with downloaded firmware.
-            img = result
+            self._store_firmware(group[0].metadata, result)
 
-            # Cache the downloaded firmware, unless the image was withdrawn by an
-            # index refresh (or invalidate_provider_caches()) during the download
-            provider_images = self._image_cache.get(image_providers[img.metadata])
-            if (
-                provider_images is not None
-                and img.metadata in provider_images
-                and provider_images[img.metadata].firmware is None
-            ):
-                _LOGGER.debug("Caching image %s", img)
-                provider_images[img.metadata] = img
+            for img in group:
+                img = img.replace(firmware=result)
 
-            if not img.check_compatibility(device, query_cmd):
-                # Ignore images that become incompatible once downloaded
-                del upgrades[img.metadata]
-            else:
-                upgrades[img.metadata] = img
+                if not img.check_compatibility(device, query_cmd):
+                    # Ignore images that become incompatible once downloaded
+                    del upgrades[img.metadata]
+                else:
+                    upgrades[img.metadata] = img
 
         await self._remove_colliding_images(upgrades)
 

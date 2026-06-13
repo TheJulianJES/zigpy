@@ -10,6 +10,7 @@ import typing
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
+import attrs
 import pytest
 
 from tests.ota.test_ota_providers import make_device
@@ -283,3 +284,127 @@ async def test_post_restore_refresh_checks_devices() -> None:
 
     sleep.assert_called_once_with(123.0)
     ota.check_all_devices_for_ota.assert_called_once_with()
+
+
+@attrs.define(frozen=True, kw_only=True)
+class FakeRemoteOtaImageMetadata(RemoteOtaImageMetadata):
+    """Remote metadata that serves local bytes instead of downloading."""
+
+    test_data: bytes = b""
+
+    async def _fetch(self) -> bytes:
+        return self.test_data
+
+
+async def test_firmware_survives_cosmetic_metadata_change(query_cmd) -> None:
+    """Firmware is not re-downloaded when only cosmetic metadata changes."""
+    device = make_device(model="device model", manufacturer_id=0x1234)
+
+    fw_image = zigpy.ota.image.OTAImage(
+        header=zigpy.ota.image.OTAImageHeader(
+            upgrade_file_id=zigpy.ota.image.OTAImageHeader.MAGIC_VALUE,
+            file_version=2,
+            image_type=query_cmd.image_type,
+            manufacturer_id=query_cmd.manufacturer_code,
+            header_version=256,
+            header_length=56,
+            field_control=0,
+            stack_version=2,
+            header_string="This is a test header!",
+            image_size=56 + 2 + 4 + 8,
+        ),
+        subelements=[zigpy.ota.image.SubElement(tag_id=0x0000, data=b"fw_image")],
+    )
+
+    meta = FakeRemoteOtaImageMetadata(
+        file_version=2,
+        manufacturer_id=query_cmd.manufacturer_code,
+        url="https://example.org/firmware.ota",
+        release_notes="Initial release notes",
+        test_data=fw_image.serialize(),
+    )
+
+    class UntrustedRemoteProvider(TrustedRemoteProvider):
+        TRUSTED = False
+
+    ota = zigpy.ota.OTA(config={config.CONF_OTA_ENABLED: False}, application=None)
+    provider = UntrustedRemoteProvider([meta])
+    ota.register_provider(provider)
+
+    with patch.object(
+        FakeRemoteOtaImageMetadata,
+        "_fetch",
+        autospec=True,
+        side_effect=FakeRemoteOtaImageMetadata._fetch,
+    ) as fetch:
+        images1 = await ota.get_ota_images(device, query_cmd)
+        assert len(images1.upgrades) == 1
+        assert images1.upgrades[0].firmware is not None
+        assert len(fetch.mock_calls) == 1
+
+        # The provider now serves the same image with new release notes
+        provider._index = [meta.replace(release_notes="Better release notes")]
+        provider.invalidate_index()
+
+        images2 = await ota.get_ota_images(device, query_cmd)
+        assert len(images2.upgrades) == 1
+        assert images2.upgrades[0].metadata.release_notes == "Better release notes"
+        assert images2.upgrades[0].firmware is not None
+
+        # The firmware was served from the cache, not re-downloaded
+        assert len(fetch.mock_calls) == 1
+
+
+async def test_firmware_downloaded_once_for_shared_fetch_identity(query_cmd) -> None:
+    """Images sharing a fetch identity are downloaded only once per check."""
+    device = make_device(model="device model", manufacturer_id=0x1234)
+
+    fw_image = zigpy.ota.image.OTAImage(
+        header=zigpy.ota.image.OTAImageHeader(
+            upgrade_file_id=zigpy.ota.image.OTAImageHeader.MAGIC_VALUE,
+            file_version=2,
+            image_type=query_cmd.image_type,
+            manufacturer_id=query_cmd.manufacturer_code,
+            header_version=256,
+            header_length=56,
+            field_control=0,
+            stack_version=2,
+            header_string="This is a test header!",
+            image_size=56 + 2 + 4 + 8,
+        ),
+        subelements=[zigpy.ota.image.SubElement(tag_id=0x0000, data=b"fw_image")],
+    )
+
+    meta1 = FakeRemoteOtaImageMetadata(
+        file_version=2,
+        manufacturer_id=query_cmd.manufacturer_code,
+        url="https://example.org/firmware.ota",
+        release_notes="From provider one",
+        test_data=fw_image.serialize(),
+    )
+    meta2 = meta1.replace(release_notes="From provider two")
+    assert meta1.firmware_cache_key == meta2.firmware_cache_key
+
+    class UntrustedRemoteProvider(TrustedRemoteProvider):
+        TRUSTED = False
+
+    class OtherUntrustedRemoteProvider(UntrustedRemoteProvider):
+        pass
+
+    ota = zigpy.ota.OTA(config={config.CONF_OTA_ENABLED: False}, application=None)
+    ota.register_provider(UntrustedRemoteProvider([meta1]))
+    ota.register_provider(OtherUntrustedRemoteProvider([meta2]))
+
+    with patch.object(
+        FakeRemoteOtaImageMetadata,
+        "_fetch",
+        autospec=True,
+        side_effect=FakeRemoteOtaImageMetadata._fetch,
+    ) as fetch:
+        images = await ota.get_ota_images(device, query_cmd)
+
+    # Both metadata variants are offered, with one shared download
+    assert len(images.upgrades) == 2
+    assert all(img.firmware is not None for img in images.upgrades)
+    assert len(fetch.mock_calls) == 1
+    assert len(ota._firmware_cache) == 1
