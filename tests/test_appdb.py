@@ -1820,3 +1820,117 @@ async def test_get_last_ota_query_cmd_returns_none(tmp_path):
     assert dev.get_last_ota_query_cmd() is None
 
     await app.shutdown()
+
+
+async def make_app_with_ota_db(database_file):
+    if isinstance(database_file, pathlib.Path):
+        database_file = str(database_file)
+
+    app = make_app(
+        {
+            conf.CONF_DATABASE: database_file,
+            conf.CONF_OTA: {
+                conf.CONF_OTA_ENABLED: True,
+                conf.CONF_OTA_PROVIDERS: [{conf.CONF_OTA_PROVIDER_TYPE: "zigpy_ota"}],
+            },
+        }
+    )
+    await app._load_db()
+
+    return app
+
+
+async def test_ota_provider_index_cache_persistence(tmp_path):
+    """Test that trusted provider indexes are persisted and restored."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_ota_db(db)
+
+    provider = next(p for p in app.ota._providers if p.TRUSTED)
+    meta = zigpy.ota.providers.RemoteOtaImageMetadata(
+        file_version=2,
+        manufacturer_id=0x1234,
+        checksum="sha3-256:" + "ab" * 32,
+        file_size=12345,
+        url="https://example.org/firmware.ota",
+        trusted=True,
+    )
+    last_updated = datetime.now(UTC) - timedelta(hours=1)
+
+    # Simulate the OTA manager persisting a refreshed index
+    app.listener_event(
+        "ota_provider_index_updated",
+        repr(provider),
+        last_updated,
+        [zigpy.ota.providers.serialize_image_metadata(meta)],
+    )
+    await app.shutdown()
+
+    app2 = await make_app_with_ota_db(db)
+    provider2 = next(p for p in app2.ota._providers if p.TRUSTED)
+
+    assert app2.ota._image_cache[provider2] == {
+        meta: zigpy.ota.OtaImageWithMetadata(metadata=meta, firmware=None)
+    }
+    # The restored freshness is at most the persisted timestamp
+    assert provider2._index_last_updated <= last_updated
+    # The post-restore refresh task is cancelled at shutdown
+    assert app2.ota._post_restore_refresh_task is not None
+    await app2.shutdown()
+    assert app2.ota._post_restore_refresh_task is None
+
+
+async def test_ota_provider_index_cache_pruning(tmp_path):
+    """Test that rows for unknown providers and corrupt rows are pruned."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_ota_db(db)
+
+    # A row for a provider that is not registered
+    app.listener_event(
+        "ota_provider_index_updated",
+        "UnknownProvider(url='https://example.org')",
+        datetime.now(UTC),
+        [],
+    )
+    await app.shutdown()
+
+    # And a corrupt row, inserted directly
+    import sqlite3
+
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            f"INSERT INTO ota_provider_index_cache{zigpy.appdb.DB_V} VALUES (?, ?, ?)",
+            ("CorruptProvider()", 0.0, "{not json"),
+        )
+
+    # Both rows are pruned at load without breaking startup
+    app2 = await make_app_with_ota_db(db)
+    await app2.shutdown()
+
+    with sqlite3.connect(str(db)) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM ota_provider_index_cache{zigpy.appdb.DB_V}"
+        ).fetchall()
+
+    assert rows == []
+
+
+async def test_ota_provider_index_cache_kept_when_ota_disabled(tmp_path):
+    """Test that cache rows are kept when OTA is disabled."""
+    db = tmp_path / "test.db"
+    app = await make_app_with_ota_db(db)
+    provider = next(p for p in app.ota._providers if p.TRUSTED)
+
+    app.listener_event(
+        "ota_provider_index_updated", repr(provider), datetime.now(UTC), []
+    )
+    await app.shutdown()
+
+    # OTA is disabled: the row is not pruned
+    app2 = await make_app_with_db(db)
+    assert not app2.ota._providers
+    await app2.shutdown()
+
+    app3 = await make_app_with_ota_db(db)
+    provider3 = next(p for p in app3.ota._providers if p.TRUSTED)
+    assert app3.ota._image_cache[provider3] == {}
+    await app3.shutdown()

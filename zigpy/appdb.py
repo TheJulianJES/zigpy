@@ -19,6 +19,7 @@ import zigpy.endpoint
 from zigpy.endpoint import Endpoint, Status as EndpointStatus
 import zigpy.exceptions
 import zigpy.group
+import zigpy.ota.providers
 import zigpy.profiles
 import zigpy.quirks
 import zigpy.state
@@ -56,7 +57,7 @@ if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
 
 LOGGER = logging.getLogger(__name__)
 
-DB_VERSION = 15
+DB_VERSION = 16
 DB_V = f"_v{DB_VERSION}"
 
 UNIX_EPOCH = datetime.fromtimestamp(0, tz=UTC)
@@ -703,6 +704,27 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         )
         await self._db.commit()
 
+    def ota_provider_index_updated(
+        self, provider_id: str, last_updated: datetime, index: list[dict]
+    ) -> None:
+        """A trusted OTA provider's index was refreshed."""
+        self.enqueue("_save_ota_provider_index", provider_id, last_updated, index)
+
+    async def _save_ota_provider_index(
+        self, provider_id: str, last_updated: datetime, index: list[dict]
+    ) -> None:
+        q = f"""INSERT INTO ota_provider_index_cache{DB_V}
+                    (provider_id, last_updated, index_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT (provider_id) DO UPDATE SET
+                    last_updated=excluded.last_updated,
+                    index_json=excluded.index_json"""
+
+        await self.execute(
+            q, (provider_id, last_updated.timestamp(), json.dumps(index))
+        )
+        await self._db.commit()
+
     def on_ota_query_cache_cleared(self, event: OtaQueryCacheClearedEvent) -> None:
         self.enqueue("_delete_ota_query_cache_entry", event)
 
@@ -792,6 +814,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
         await self._load_routes()
         await self._load_network_backups()
         await self._load_ota_query_cache()
+        await self._load_ota_provider_index_cache()
 
         await self._db.commit()
 
@@ -1140,6 +1163,52 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                         cluster.last_query_cmd = cmd
                         break
 
+    async def _load_ota_provider_index_cache(self) -> None:
+        ota = self._application.ota
+        stale_provider_ids = []
+
+        async with self.execute(
+            f"SELECT provider_id, last_updated, index_json"
+            f" FROM ota_provider_index_cache{DB_V}"
+        ) as cursor:
+            async for provider_id, last_updated, index_json in cursor:
+                try:
+                    index = json.loads(index_json)
+                except ValueError:
+                    index = None
+
+                if not isinstance(index, list):
+                    stale_provider_ids.append(provider_id)
+                    continue
+
+                metadata = [
+                    meta
+                    for meta in (
+                        zigpy.ota.providers.deserialize_image_metadata(obj)
+                        for obj in index
+                    )
+                    if meta is not None
+                ]
+
+                if not ota.restore_cached_index(
+                    provider_id,
+                    datetime.fromtimestamp(last_updated, tz=UTC),
+                    metadata,
+                ):
+                    stale_provider_ids.append(provider_id)
+
+        # Prune rows for providers that are no longer registered. If OTA is
+        # disabled entirely, keep the rows: the user may re-enable it later.
+        if not ota._providers:
+            return
+
+        for provider_id in stale_provider_ids:
+            LOGGER.debug("Pruning stale OTA provider index cache: %s", provider_id)
+            await self.execute(
+                f"DELETE FROM ota_provider_index_cache{DB_V} WHERE provider_id = ?",
+                (provider_id,),
+            )
+
     async def _register_device_listeners(self) -> None:
         for dev in self._application.devices.values():
             dev.add_context_listener(self)
@@ -1232,6 +1301,7 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
                 (self._migrate_to_v13, 13),
                 (self._migrate_to_v14, 14),
                 (self._migrate_to_v15, 15),
+                (self._migrate_to_v16, 16),
             ]:
                 if db_version >= min(to_db_version, DB_VERSION):
                     continue
@@ -1697,3 +1767,23 @@ class PersistingListener(zigpy.util.CatchingTaskMixin):
             }
         )
         # ota_query_cache_v15 is new and starts empty
+
+    async def _migrate_to_v16(self) -> None:
+        """Schema v16 adds the `ota_provider_index_cache` table."""
+        await self._migrate_tables(
+            {
+                "devices_v15": "devices_v16",
+                "endpoints_v15": "endpoints_v16",
+                "neighbors_v15": "neighbors_v16",
+                "routes_v15": "routes_v16",
+                "node_descriptors_v15": "node_descriptors_v16",
+                "groups_v15": "groups_v16",
+                "group_members_v15": "group_members_v16",
+                "relays_v15": "relays_v16",
+                "network_backups_v15": "network_backups_v16",
+                "clusters_v15": "clusters_v16",
+                "attributes_cache_v15": "attributes_cache_v16",
+                "ota_query_cache_v15": "ota_query_cache_v16",
+            }
+        )
+        # ota_provider_index_cache_v16 is new and starts empty
