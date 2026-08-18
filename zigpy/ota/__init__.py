@@ -123,7 +123,10 @@ class OtaImageWithMetadata(t.BaseDataclassMixin):
     @property
     def specificity(self) -> int:
         """Return a numerical representation of the metadata specificity.
-        Higher specificity is preferred to lower when picking a final OTA image.
+
+        Only used to break ties between images with the same file version:
+        candidates are sorted by (version, specificity), so higher specificity
+        can never make an image with a lower file version preferred.
         """
 
         total = 0
