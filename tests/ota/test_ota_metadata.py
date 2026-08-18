@@ -107,6 +107,17 @@ def test_metadata_specificity(image_with_metadata: OtaImageWithMetadata) -> None
         < image_with_metadata.specificity
     )
 
+    # Vacuous constraints (min=0 / max=0xFFFFFFFF can never exclude a device)
+    # do not increase specificity
+    assert (
+        replace_meta(
+            min_current_file_version=0, max_current_file_version=0xFFFFFFFF
+        ).specificity
+        == replace_meta(
+            min_current_file_version=None, max_current_file_version=None
+        ).specificity
+    )
+
 
 async def test_metadata_compatibility(
     image_with_metadata: OtaImageWithMetadata,

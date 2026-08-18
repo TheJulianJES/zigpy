@@ -140,10 +140,11 @@ class OtaImageWithMetadata(t.BaseDataclassMixin):
         if self._manufacturer_id is not None:
             total += 100
 
-        if self.metadata.min_current_file_version is not None:
+        # min=0 / max=0xFFFFFFFF can never exclude a device, don't count them
+        if self.metadata.min_current_file_version not in (None, 0):
             total += 10
 
-        if self.metadata.max_current_file_version is not None:
+        if self.metadata.max_current_file_version not in (None, 0xFFFFFFFF):
             total += 10
 
         if self._min_hardware_version is not None:
