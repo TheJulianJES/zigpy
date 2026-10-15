@@ -213,6 +213,65 @@ async def test_initialize_read_ota_unsupported(
     assert dev.manufacturer == "Manufacturer"
 
 
+async def test_initialize_read_ota_server_only(
+    app: zigpy.application.ControllerApplication,
+) -> None:
+    """Test that devices exposing OTA only as a server cluster are handled on join."""
+    dev = app.add_device(nwk=0x1234, ieee=t.EUI64.convert("aa:bb:cc:dd:ee:ff:00:11"))
+    dev.node_desc = make_node_desc()
+
+    ep = dev.add_endpoint(1)
+    ep.status = endpoint.Status.ZDO_INIT
+
+    basic = ep.add_input_cluster(Basic.cluster_id)
+    ota = ep.add_input_cluster(Ota.cluster_id)
+
+    with (
+        mock_attribute_reads(basic, {"model": "Model", "manufacturer": "Manufacturer"}),
+        mock_attribute_reads(ota, {"current_file_version": 0x12345678}),
+    ):
+        await dev.initialize()
+
+    assert dev.is_initialized
+    assert ota.get(Ota.AttributeDefs.current_file_version.id) == 0x12345678
+
+    packet = app.send_packet.call_args_list[0][0][0]
+    hdr, cmd = ota.deserialize(packet.data.serialize())
+    assert isinstance(cmd, Ota.ImageNotifyCommand)
+    assert hdr.direction == foundation.Direction.Server_to_Client
+
+
+@pytest.mark.parametrize("is_server", [False, True])
+async def test_initialize_read_ota_failure_does_not_block(
+    app: zigpy.application.ControllerApplication, is_server: bool
+) -> None:
+    """Test that a device not answering the OTA version read still initializes."""
+    dev = app.add_device(nwk=0x1234, ieee=t.EUI64.convert("aa:bb:cc:dd:ee:ff:00:11"))
+    dev.node_desc = make_node_desc()
+
+    ep = dev.add_endpoint(1)
+    ep.status = endpoint.Status.ZDO_INIT
+
+    basic = ep.add_input_cluster(Basic.cluster_id)
+
+    if is_server:
+        ota = ep.add_input_cluster(Ota.cluster_id)
+    else:
+        ota = ep.add_output_cluster(Ota.cluster_id)
+
+    ota.read_attributes_raw = AsyncMock(side_effect=TimeoutError)
+    ota.image_notify = AsyncMock()
+
+    with mock_attribute_reads(
+        basic, {"model": "Model", "manufacturer": "Manufacturer"}
+    ):
+        await dev.initialize()
+
+    assert dev.is_initialized
+    ota.read_attributes_raw.assert_awaited_once()
+    ota.image_notify.assert_awaited_once()
+
+
 async def test_initialize_fail(dev):
     async def mockrequest(nwk, tries=None, delay=None):
         return [1, dev.nwk, []]
@@ -2574,6 +2633,123 @@ async def test_update_firmware_triggers_reinterview(monkeypatch, dev):
 
     assert result == foundation.Status.SUCCESS
     dev.reinterview.assert_awaited_once()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+async def test_update_firmware_reinterview_server_ota_cluster(
+    monkeypatch, app: zigpy.application.ControllerApplication
+) -> None:
+    """Test that the reinterviewed device knows the version of a server OTA cluster."""
+    ieee = t.EUI64.convert("aa:bb:cc:dd:ee:ff:00:11")
+    node_desc = make_node_desc()
+    file_version = 0x00000001
+
+    async def mock_get_node_descriptor(self):
+        self.node_desc = node_desc
+        return node_desc
+
+    async def mockrequest(*args, **kwargs):
+        return [0, None, [1]]
+
+    async def mockepinit(self, *args, **kwargs):
+        self.status = endpoint.Status.ZDO_INIT
+        self.profile_id = zha.PROFILE_ID
+        self.add_input_cluster(Basic.cluster_id)
+        self.add_input_cluster(Ota.cluster_id)
+
+    async def mock_ep_get_model_info(self):
+        return "Model", "Manufacturer"
+
+    def send_packet(packet: t.ZigbeePacket) -> None:
+        """Answer OTA version reads like a device with a server OTA cluster."""
+        hdr, _ = foundation.ZCLHeader.deserialize(packet.data.serialize())
+
+        if (
+            packet.cluster_id != Ota.cluster_id
+            or hdr.frame_control.frame_type != foundation.FrameType.GLOBAL_COMMAND
+            or hdr.command_id != foundation.GeneralCommand.Read_Attributes
+        ):
+            return
+
+        # The device answers as the OTA client it really is
+        assert hdr.direction == foundation.Direction.Server_to_Client
+
+        rsp_hdr = foundation.ZCLHeader.general(
+            tsn=hdr.tsn,
+            command_id=foundation.GeneralCommand.Read_Attributes_rsp,
+            direction=foundation.Direction.Client_to_Server,
+        )
+        rsp = foundation.GENERAL_COMMANDS[
+            foundation.GeneralCommand.Read_Attributes_rsp
+        ].schema(
+            status_records=[
+                foundation.ReadAttributeRecord(
+                    attrid=Ota.AttributeDefs.current_file_version.id,
+                    status=foundation.Status.SUCCESS,
+                    value=foundation.TypeValue(
+                        type=Ota.AttributeDefs.current_file_version.zcl_type,
+                        value=Ota.AttributeDefs.current_file_version.type(file_version),
+                    ),
+                )
+            ]
+        )
+
+        asyncio.get_running_loop().call_soon(
+            app.packet_received,
+            t.ZigbeePacket(
+                profile_id=zha.PROFILE_ID,
+                cluster_id=Ota.cluster_id,
+                src_ep=packet.dst_ep,
+                dst_ep=packet.src_ep,
+                data=t.SerializableBytes(rsp_hdr.serialize() + rsp.serialize()),
+                src=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x1234),
+                dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=0x0000),
+            ),
+        )
+
+    app.send_packet.side_effect = send_packet
+
+    monkeypatch.setattr(device.Device, "get_node_descriptor", mock_get_node_descriptor)
+    monkeypatch.setattr(endpoint.Endpoint, "initialize", mockepinit)
+    monkeypatch.setattr(endpoint.Endpoint, "get_model_info", mock_ep_get_model_info)
+
+    original_init = device.Device.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.zdo.Active_EP_req = mockrequest
+
+    monkeypatch.setattr(device.Device, "__init__", patched_init)
+
+    dev = app.add_device(ieee=ieee, nwk=t.NWK(0x1234))
+    await dev.initialize()
+
+    assert dev.is_initialized
+    assert (
+        dev.endpoints[1]
+        .in_clusters[Ota.cluster_id]
+        .get(Ota.AttributeDefs.current_file_version.id)
+        == 0x00000001
+    )
+
+    monkeypatch.setattr(
+        "zigpy.device.update_firmware",
+        AsyncMock(return_value=foundation.Status.SUCCESS),
+    )
+
+    # The device runs the new firmware after the update
+    file_version = 0x00000002
+    result = await dev.update_firmware(MagicMock(), progress_callback=MagicMock())
+    assert result == foundation.Status.SUCCESS
+
+    new_dev = app.devices[ieee]
+    assert new_dev is not dev
+    assert (
+        new_dev.endpoints[1]
+        .in_clusters[Ota.cluster_id]
+        .get(Ota.AttributeDefs.current_file_version.id)
+        == 0x00000002
+    )
 
 
 async def test_request_retry_success(app) -> None:

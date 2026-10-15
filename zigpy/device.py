@@ -869,13 +869,23 @@ class ZigbeeDevice(BaseDevice):
                         self.manufacturer = manufacturer
 
         try:
-            ota = self.find_cluster(
-                cluster_id=Ota.cluster_id, cluster_type=ClusterType.Client
-            )
+            if self.ieee == self._application.state.node_info.ieee:
+                # The coordinator's own server OTA cluster is zigpy's OTA server
+                ota = self.find_cluster(
+                    cluster_id=Ota.cluster_id, cluster_type=ClusterType.Client
+                )
+            else:
+                ota = self.find_ota_cluster()
         except ValueError:
             self.debug("Device does not support OTA cluster")
         else:
-            await ota.read_attributes([Ota.AttributeDefs.current_file_version.name])
+            try:
+                await ota.read_attributes([Ota.AttributeDefs.current_file_version.name])
+            except Exception:  # noqa: BLE001
+                self.debug(
+                    "Failed to read OTA file version during initialization",
+                    exc_info=True,
+                )
 
             # Notify the device that OTA images may be available so it queries us
             try:
