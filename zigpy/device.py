@@ -74,11 +74,31 @@ DEFAULT_FAST_POLL_TIMEOUT = 30
 DEFAULT_REQUEST_RETRIES = 2
 DEFAULT_REQUEST_RETRY_DELAY = 0.1
 
+# After an OTA, the device reboots a few seconds to a minute after `upgrade_end`. A read
+# sent before the reboot is lost, so a new read is sent whenever the device is heard
+# from, or every interval if it stays silent, without waiting for the previous one's
+# reply timeout. Once too many are pending, the oldest one is given up on, after at
+# least one interval. The minimum interval between reads sent because the device was
+# heard from doubles after every one of them that doesn't confirm the update, up to the
+# full interval, and resets once the device was silent for a full interval.
 AFTER_OTA_ATTR_READ_DELAY = 10
+AFTER_OTA_MIN_READ_INTERVAL = 1
+AFTER_OTA_MAX_PENDING_READS = 2
+AFTER_OTA_REACHABLE_TIMEOUT = 300
 
 # zgpDuplicateTimeout: unprotected GPDFs repeating the last MAC sequence number
 # within this many seconds are duplicates
 GP_DUPLICATE_TIMEOUT = timedelta(seconds=2)
+
+
+@dataclass(frozen=True, slots=True)
+class _LastSeenListener:
+    """Device listener that calls back whenever the device is heard from."""
+
+    callback: Callable[[], None]
+
+    def device_last_seen_updated(self, last_seen: datetime) -> None:
+        self.callback()
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,6 +593,7 @@ class ZigbeeDevice(BaseDevice):
         self._send_sequence: int = 0
 
         self._fast_polling = False
+        self._waiting_after_ota = False
 
         self._packet_debouncer = zigpy.datastructures.Debouncer()
         self._concurrent_requests_semaphore = zigpy.datastructures.RequestLimiter(
@@ -824,6 +845,7 @@ class ZigbeeDevice(BaseDevice):
                 or self.reinterviewing
                 or self._concurrent_requests_semaphore.active_requests > 0
                 or self._fast_polling
+                or self._waiting_after_ota
             ):
                 # Initiate fast polling mode if we are initializing or waiting for
                 # requests to be sent
@@ -1458,6 +1480,11 @@ class ZigbeeDevice(BaseDevice):
         ota = self.find_cluster(
             cluster_id=Ota.cluster_id, cluster_type=ClusterType.Client
         )
+        old_version = ota.get(Ota.AttributeDefs.current_file_version.id)
+
+        if old_version is None and ota.last_query_cmd is not None:
+            old_version = ota.last_query_cmd.current_file_version
+
         ota.update_attribute(Ota.AttributeDefs.current_file_version.id, None)
         ota.last_query_cmd = None
         ota.emit(
@@ -1468,11 +1495,8 @@ class ZigbeeDevice(BaseDevice):
             ),
         )
 
-        await asyncio.sleep(AFTER_OTA_ATTR_READ_DELAY)
-        await ota.read_attributes(
-            [Ota.AttributeDefs.current_file_version.name],
-            retries=10,
-            retry_delay=AFTER_OTA_ATTR_READ_DELAY,
+        await self._read_version_after_ota(
+            ota, old_version=old_version, new_version=image.metadata.file_version
         )
 
         # Prompt device to send QueryNextImage with updated version for query cache
@@ -1490,6 +1514,161 @@ class ZigbeeDevice(BaseDevice):
         await self.reinterview()
 
         return result
+
+    async def _read_version_after_ota(
+        self, ota: Cluster, *, old_version: int | None, new_version: int
+    ) -> None:
+        """Read the firmware version until the rebooted device reports a new one.
+
+        A sleeping end device only receives a frame when it polls its parent, and it
+        polls right after it transmits. So a read is sent as soon as the device is heard
+        from (announce, rejoin, check-in, report), or every `AFTER_OTA_ATTR_READ_DELAY`
+        seconds if it stays silent. A read that reached the device right before it
+        rebooted is never answered, so new reads don't wait for older ones to time out,
+        and the first answer wins.
+        """
+        loop = asyncio.get_running_loop()
+        wakeup = asyncio.Event()
+        reads: dict[asyncio.Task, float] = {}
+        heard_reads: set[asyncio.Task] = set()
+        min_interval = AFTER_OTA_MIN_READ_INTERVAL
+        last_read = loop.time() - min_interval
+        next_read = loop.time() + AFTER_OTA_ATTR_READ_DELAY
+        heard = False
+        answered = False
+
+        def on_heard() -> None:
+            nonlocal heard
+            heard = True
+            wakeup.set()
+
+        listener = _LastSeenListener(on_heard)
+        self.add_listener(listener)
+        self._waiting_after_ota = True
+
+        try:
+            async with asyncio_timeout(AFTER_OTA_REACHABLE_TIMEOUT):
+                while True:
+                    read_at = next_read
+
+                    if heard:
+                        read_at = min(read_at, last_read + min_interval)
+
+                    if len(reads) >= AFTER_OTA_MAX_PENDING_READS:
+                        read_at = max(
+                            read_at, min(reads.values()) + AFTER_OTA_ATTR_READ_DELAY
+                        )
+
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio_timeout(max(0, read_at - loop.time())):
+                            await wakeup.wait()
+
+                    wakeup.clear()
+
+                    for read in [read for read in reads if read.done()]:
+                        del reads[read]
+
+                        # Back off reads sent because the device was heard from
+                        backoff = read in heard_reads
+                        heard_reads.discard(read)
+
+                        try:
+                            success, _ = read.result()
+                        except zigpy.exceptions.ParsingError:
+                            raise
+                        except (zigpy.exceptions.ZigbeeException, TimeoutError):
+                            # Anything heard in the meantime triggers the next read
+                            self.debug("Post-OTA version read failed", exc_info=True)
+
+                            if backoff:
+                                min_interval = min(
+                                    2 * min_interval, AFTER_OTA_ATTR_READ_DELAY
+                                )
+
+                            continue
+
+                        answered = True
+                        version = success.get(
+                            Ota.AttributeDefs.current_file_version.name
+                        )
+
+                        # A device that answers before rebooting reports the old
+                        # version. The answer itself was heard, so don't re-read
+                        # until the device is heard from again.
+                        if (
+                            old_version not in (None, new_version)
+                            and version == old_version
+                        ):
+                            self.debug("Device still reports version %s", version)
+                            heard = False
+
+                            if backoff:
+                                min_interval = min(
+                                    2 * min_interval, AFTER_OTA_ATTR_READ_DELAY
+                                )
+
+                            continue
+
+                        return
+
+                    now = loop.time()
+
+                    if now < next_read and not (
+                        heard and now >= last_read + min_interval
+                    ):
+                        continue
+
+                    if len(reads) >= AFTER_OTA_MAX_PENDING_READS:
+                        oldest = min(reads, key=reads.__getitem__)
+
+                        if now < reads[oldest] + AFTER_OTA_ATTR_READ_DELAY:
+                            continue
+
+                        # Its send is long done, so only stop waiting for its reply
+                        del reads[oldest]
+                        heard_reads.discard(oldest)
+                        oldest.cancel()
+                        await asyncio.gather(oldest, return_exceptions=True)
+
+                    # The device was silent for a full interval
+                    if not heard:
+                        min_interval = AFTER_OTA_MIN_READ_INTERVAL
+
+                    triggered_by_heard = heard
+                    heard = False
+                    last_read = loop.time()
+                    next_read = last_read + AFTER_OTA_ATTR_READ_DELAY
+
+                    read = asyncio.create_task(
+                        ota.read_attributes(
+                            [Ota.AttributeDefs.current_file_version.name],
+                            retries=0,
+                            priority=t.PacketPriority.HIGH,
+                        )
+                    )
+                    read.add_done_callback(lambda _: wakeup.set())
+                    reads[read] = last_read
+
+                    if triggered_by_heard:
+                        heard_reads.add(read)
+        except TimeoutError:
+            if not answered:
+                raise
+
+            # The device may have rejected the image and kept its old firmware, or
+            # gone silent after answering right before it rebooted
+            self.warning(
+                "Device did not report a new version after OTA, last reported %s",
+                old_version,
+            )
+        finally:
+            self._waiting_after_ota = False
+            self.remove_listener(listener)
+
+            for read in reads:
+                read.cancel()
+
+            await asyncio.gather(*reads, return_exceptions=True)
 
     def get_last_ota_query_cmd(self) -> QueryNextImageCommand | None:
         """Return the last cached QueryNextImageCommand, preferring client clusters."""
