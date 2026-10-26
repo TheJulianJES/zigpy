@@ -2340,6 +2340,282 @@ async def test_update_firmware_triggers_reinterview(monkeypatch, dev):
     dev.reinterview.assert_awaited_once()
 
 
+OLD_VERSION = 0x00000001
+NEW_VERSION = 0x00000002
+VERSION_READ = call(
+    [Ota.AttributeDefs.current_file_version.name],
+    retries=0,
+    priority=t.PacketPriority.HIGH,
+)
+
+
+def _setup_post_ota(
+    monkeypatch, dev: device.Device, *, old_version: int | None = OLD_VERSION
+) -> zigpy.zcl.Cluster:
+    """Make `update_firmware` succeed and return the mocked OTA client cluster."""
+    ep = dev.add_endpoint(1)
+    cluster = zigpy.zcl.Cluster.from_id(ep, Ota.cluster_id, is_server=False)
+    ep.add_output_cluster(Ota.cluster_id, cluster)
+
+    if old_version is not None:
+        cluster.update_attribute(Ota.AttributeDefs.current_file_version.id, old_version)
+
+    monkeypatch.setattr(
+        "zigpy.device.update_firmware",
+        AsyncMock(return_value=foundation.Status.SUCCESS),
+    )
+
+    cluster.read_attributes = AsyncMock()
+    cluster.image_notify = AsyncMock()
+    dev.reinterview = AsyncMock()
+
+    return cluster
+
+
+def _version_read(version: int | None) -> tuple[dict, dict]:
+    if version is None:
+        return {}, {Ota.AttributeDefs.current_file_version.name: 0x86}
+
+    return {Ota.AttributeDefs.current_file_version.name: version}, {}
+
+
+def _ota_image(version: int = NEW_VERSION) -> MagicMock:
+    image = MagicMock()
+    image.metadata.file_version = version
+    return image
+
+
+async def _lost_read() -> None:
+    """A read that reached the device right before it rebooted."""
+    await asyncio.Future()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.05)
+async def test_update_firmware_read_lost_in_reboot(monkeypatch, dev):
+    """Test that a new read is sent while the previous one is still pending."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    lost_read_cancelled = False
+
+    async def read_attributes(*args, **kwargs):
+        nonlocal lost_read_cancelled
+
+        if cluster.read_attributes.await_count == 1:
+            try:
+                await _lost_read()
+            except asyncio.CancelledError:
+                lost_read_cancelled = True
+                raise
+
+        return _version_read(NEW_VERSION)
+
+    cluster.read_attributes.side_effect = read_attributes
+
+    async with asyncio.timeout(1):
+        result = await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    assert result == foundation.Status.SUCCESS
+    assert cluster.read_attributes.mock_calls == [VERSION_READ, VERSION_READ]
+    assert lost_read_cancelled
+    cluster.image_notify.assert_awaited_once()
+    dev.reinterview.assert_awaited_once()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.02)
+@patch("zigpy.device.AFTER_OTA_REACHABLE_TIMEOUT", 0.2)
+async def test_update_firmware_read_pending_limit(monkeypatch, dev):
+    """Test that the oldest pending read is given up on once too many are pending."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    pending = 0
+    max_pending = 0
+    cancelled = 0
+
+    async def read_attributes(*args, **kwargs):
+        nonlocal pending, max_pending, cancelled
+        pending += 1
+        max_pending = max(max_pending, pending)
+
+        try:
+            await _lost_read()
+        except asyncio.CancelledError:
+            cancelled += 1
+            raise
+        finally:
+            pending -= 1
+
+    cluster.read_attributes.side_effect = read_attributes
+
+    with pytest.raises(TimeoutError):
+        await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    calls = len(cluster.read_attributes.mock_calls)
+    assert 4 <= calls <= 11
+    assert max_pending == device.AFTER_OTA_MAX_PENDING_READS
+    assert pending == 0
+    assert cancelled == calls
+    dev.reinterview.assert_not_called()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.05)
+@patch("zigpy.device.AFTER_OTA_REACHABLE_TIMEOUT", 0.27)
+async def test_update_firmware_read_failures_are_spaced(monkeypatch, dev):
+    """Test that reads failing right away are still sent once per interval."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    cluster.read_attributes.side_effect = zigpy.exceptions.DeliveryError("MAC_NO_ACK")
+
+    with pytest.raises(TimeoutError):
+        await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    assert 2 <= len(cluster.read_attributes.mock_calls) <= 6
+    cluster.image_notify.assert_not_called()
+    dev.reinterview.assert_not_called()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+async def test_update_firmware_read_failures_are_retried(monkeypatch, dev):
+    """Test that failed post-OTA reads are retried."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    cluster.read_attributes.side_effect = [
+        zigpy.exceptions.DeliveryError("MAC_NO_ACK"),
+        TimeoutError(),
+        _version_read(NEW_VERSION),
+    ]
+
+    result = await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    assert result == foundation.Status.SUCCESS
+    assert len(cluster.read_attributes.mock_calls) == 3
+    dev.reinterview.assert_awaited_once()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+async def test_update_firmware_read_parsing_error(monkeypatch, dev):
+    """Test that an unparsable answer is not retried."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    cluster.read_attributes.side_effect = zigpy.exceptions.ParsingError()
+
+    with pytest.raises(zigpy.exceptions.ParsingError):
+        await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    assert len(cluster.read_attributes.mock_calls) == 1
+    dev.reinterview.assert_not_called()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+async def test_update_firmware_read_retries_old_version(monkeypatch, dev):
+    """Test that a device answering with its old version before rebooting is re-read."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    cluster.read_attributes.side_effect = [
+        _version_read(OLD_VERSION),
+        _version_read(NEW_VERSION),
+    ]
+
+    result = await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    assert result == foundation.Status.SUCCESS
+    assert len(cluster.read_attributes.mock_calls) == 2
+    dev.reinterview.assert_awaited_once()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+async def test_update_firmware_read_old_version_from_query(monkeypatch, dev):
+    """Test that the old version falls back to the last QueryNextImage."""
+    cluster = _setup_post_ota(monkeypatch, dev, old_version=None)
+    cluster.last_query_cmd = Ota.ServerCommandDefs.query_next_image.schema(
+        field_control=0,
+        manufacturer_code=0x1234,
+        image_type=0x5678,
+        current_file_version=OLD_VERSION,
+    )
+    cluster.read_attributes.side_effect = [
+        _version_read(OLD_VERSION),
+        _version_read(NEW_VERSION),
+    ]
+
+    result = await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    assert result == foundation.Status.SUCCESS
+    assert len(cluster.read_attributes.mock_calls) == 2
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+@patch("zigpy.device.AFTER_OTA_REACHABLE_TIMEOUT", 0.1)
+async def test_update_firmware_read_keeps_old_version(monkeypatch, dev, caplog):
+    """Test that a device that keeps its old version still finishes the update."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    cluster.read_attributes.return_value = _version_read(OLD_VERSION)
+
+    with caplog.at_level(logging.WARNING):
+        result = await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    assert result == foundation.Status.SUCCESS
+    assert len(cluster.read_attributes.mock_calls) > 1
+    assert "Device did not report a new version after OTA" in caplog.text
+    cluster.image_notify.assert_awaited_once()
+    dev.reinterview.assert_awaited_once()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+@patch("zigpy.device.AFTER_OTA_REACHABLE_TIMEOUT", 0.1)
+async def test_update_firmware_read_old_version_then_silent(monkeypatch, dev, caplog):
+    """Test that a device answering only before it rebooted still finishes the update."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    cluster.read_attributes.side_effect = [_version_read(OLD_VERSION)] + [
+        zigpy.exceptions.DeliveryError("MAC_INDIRECT_TIMEOUT")
+    ] * 100
+
+    with caplog.at_level(logging.WARNING):
+        result = await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    # Like before, an answer counts, even one with the old version
+    assert result == foundation.Status.SUCCESS
+    assert "Device did not report a new version after OTA" in caplog.text
+    dev.reinterview.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("old_version", "new_version", "read_version"),
+    [
+        # Re-installing the same version
+        (OLD_VERSION, OLD_VERSION, OLD_VERSION),
+        # The old version is unknown
+        (None, NEW_VERSION, OLD_VERSION),
+        # The device doesn't support reading the version
+        (None, NEW_VERSION, None),
+        (OLD_VERSION, NEW_VERSION, None),
+    ],
+)
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+async def test_update_firmware_read_accepts_version(
+    monkeypatch, dev, old_version, new_version, read_version
+):
+    """Test the cases where the version read can't tell that the device rebooted."""
+    cluster = _setup_post_ota(monkeypatch, dev, old_version=old_version)
+    cluster.read_attributes.side_effect = [_version_read(read_version)]
+
+    result = await dev.update_firmware(
+        _ota_image(new_version), progress_callback=MagicMock()
+    )
+
+    assert result == foundation.Status.SUCCESS
+    assert len(cluster.read_attributes.mock_calls) == 1
+    dev.reinterview.assert_awaited_once()
+
+
+@patch("zigpy.device.AFTER_OTA_ATTR_READ_DELAY", 0.01)
+@patch("zigpy.device.AFTER_OTA_REACHABLE_TIMEOUT", 0.1)
+async def test_update_firmware_read_gives_up(monkeypatch, dev):
+    """Test that the post-OTA read gives up when the device never answers."""
+    cluster = _setup_post_ota(monkeypatch, dev)
+    cluster.read_attributes.side_effect = zigpy.exceptions.DeliveryError("Failure")
+
+    with pytest.raises(TimeoutError):
+        await dev.update_firmware(_ota_image(), progress_callback=MagicMock())
+
+    assert len(cluster.read_attributes.mock_calls) > 1
+    cluster.image_notify.assert_not_called()
+    dev.reinterview.assert_not_called()
+
+
 async def test_request_retry_success(app) -> None:
     """Test retry logic succeeding after a few attempts."""
     tsn = 0x12

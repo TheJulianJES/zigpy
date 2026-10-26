@@ -74,7 +74,13 @@ DEFAULT_FAST_POLL_TIMEOUT = 30
 DEFAULT_REQUEST_RETRIES = 2
 DEFAULT_REQUEST_RETRY_DELAY = 0.1
 
+# After an OTA, the device reboots a few seconds to a minute after `upgrade_end`. A read
+# sent before the reboot is lost, so a new read is sent every interval without waiting
+# for the previous one's reply timeout. Once too many are pending, the oldest one is
+# given up on, after at least one interval.
 AFTER_OTA_ATTR_READ_DELAY = 10
+AFTER_OTA_MAX_PENDING_READS = 2
+AFTER_OTA_REACHABLE_TIMEOUT = 300
 
 # zgpDuplicateTimeout: unprotected GPDFs repeating the last MAC sequence number
 # within this many seconds are duplicates
@@ -1458,6 +1464,11 @@ class ZigbeeDevice(BaseDevice):
         ota = self.find_cluster(
             cluster_id=Ota.cluster_id, cluster_type=ClusterType.Client
         )
+        old_version = ota.get(Ota.AttributeDefs.current_file_version.id)
+
+        if old_version is None and ota.last_query_cmd is not None:
+            old_version = ota.last_query_cmd.current_file_version
+
         ota.update_attribute(Ota.AttributeDefs.current_file_version.id, None)
         ota.last_query_cmd = None
         ota.emit(
@@ -1468,11 +1479,8 @@ class ZigbeeDevice(BaseDevice):
             ),
         )
 
-        await asyncio.sleep(AFTER_OTA_ATTR_READ_DELAY)
-        await ota.read_attributes(
-            [Ota.AttributeDefs.current_file_version.name],
-            retries=10,
-            retry_delay=AFTER_OTA_ATTR_READ_DELAY,
+        await self._read_version_after_ota(
+            ota, old_version=old_version, new_version=image.metadata.file_version
         )
 
         # Prompt device to send QueryNextImage with updated version for query cache
@@ -1490,6 +1498,106 @@ class ZigbeeDevice(BaseDevice):
         await self.reinterview()
 
         return result
+
+    async def _read_version_after_ota(
+        self, ota: Cluster, *, old_version: int | None, new_version: int
+    ) -> None:
+        """Read the firmware version until the rebooted device reports a new one.
+
+        A read that reaches the device right before it reboots is never answered, and
+        the request only gives up on it after the reply timeout (28 s for end devices).
+        So a new read is sent every `AFTER_OTA_ATTR_READ_DELAY` seconds while older ones
+        are still pending, and the first answer wins.
+        """
+        loop = asyncio.get_running_loop()
+        reads: dict[asyncio.Task, float] = {}
+        next_read = loop.time() + AFTER_OTA_ATTR_READ_DELAY
+        answered = False
+
+        try:
+            async with asyncio_timeout(AFTER_OTA_REACHABLE_TIMEOUT):
+                while True:
+                    read_at = next_read
+
+                    if len(reads) >= AFTER_OTA_MAX_PENDING_READS:
+                        read_at = max(
+                            read_at, min(reads.values()) + AFTER_OTA_ATTR_READ_DELAY
+                        )
+
+                    delay = max(0, read_at - loop.time())
+
+                    if reads:
+                        done, _ = await asyncio.wait(
+                            reads, timeout=delay, return_when=asyncio.FIRST_COMPLETED
+                        )
+                    else:
+                        await asyncio.sleep(delay)
+                        done = set()
+
+                    for read in done:
+                        del reads[read]
+
+                        try:
+                            success, _ = read.result()
+                        except zigpy.exceptions.ParsingError:
+                            raise
+                        except (zigpy.exceptions.ZigbeeException, TimeoutError):
+                            self.debug("Post-OTA version read failed", exc_info=True)
+                            continue
+
+                        answered = True
+                        version = success.get(
+                            Ota.AttributeDefs.current_file_version.name
+                        )
+
+                        # A device that answers before rebooting reports the old version
+                        if (
+                            old_version not in (None, new_version)
+                            and version == old_version
+                        ):
+                            self.debug("Device still reports version %s", version)
+                            continue
+
+                        return
+
+                    if loop.time() < next_read:
+                        continue
+
+                    if len(reads) >= AFTER_OTA_MAX_PENDING_READS:
+                        oldest = min(reads, key=reads.__getitem__)
+
+                        if loop.time() < reads[oldest] + AFTER_OTA_ATTR_READ_DELAY:
+                            continue
+
+                        # Its send is long done, so only stop waiting for its reply
+                        del reads[oldest]
+                        oldest.cancel()
+                        await asyncio.gather(oldest, return_exceptions=True)
+
+                    next_read = loop.time() + AFTER_OTA_ATTR_READ_DELAY
+                    read = asyncio.create_task(
+                        ota.read_attributes(
+                            [Ota.AttributeDefs.current_file_version.name],
+                            retries=0,
+                            priority=t.PacketPriority.HIGH,
+                        )
+                    )
+                    reads[read] = loop.time()
+        except TimeoutError:
+            if not answered:
+                raise
+
+            # The device may have rejected the image and kept its old firmware, or
+            # gone silent after answering right before it rebooted
+            self.warning(
+                "Device did not report a new version after OTA, last reported %s",
+                old_version,
+            )
+        finally:
+            for read in reads:
+                read.cancel()
+
+            await asyncio.gather(*reads, return_exceptions=True)
 
     def get_last_ota_query_cmd(self) -> QueryNextImageCommand | None:
         """Return the last cached QueryNextImageCommand, preferring client clusters."""
