@@ -467,6 +467,44 @@ async def test_read_attributes_listener_error(cluster):
     ]
 
 
+async def test_read_attributes_store_hook(cluster):
+    """Test overriding how successfully read attribute values are stored."""
+
+    cluster.request = AsyncMock(
+        return_value=[
+            [
+                _mk_rar(4, "Manufacturer"),
+                _mk_rar(5, None, foundation.Status.UNSUPPORTED_ATTRIBUTE),
+            ]
+        ]
+    )
+
+    events = []
+    for event_type in (AttributeReadEvent.event_type, AttributeUpdatedEvent.event_type):
+        cluster.on_event(event_type, events.append)
+
+    with patch.object(cluster, "_store_read_attribute_value") as store_mock:
+        success, failure = await cluster.read_attributes(["manufacturer", "model"])
+
+    assert success == {"manufacturer": "Manufacturer"}
+    assert failure == {"model": foundation.Status.UNSUPPORTED_ATTRIBUTE}
+
+    # only successful values are passed on, and the override decides what to store
+    assert store_mock.mock_calls == [
+        call(
+            Basic.AttributeDefs.manufacturer,
+            "Manufacturer",
+            raw_value="Manufacturer",
+            manufacturer_code=None,
+        )
+    ]
+    assert Basic.AttributeDefs.manufacturer.id not in cluster._attr_cache
+    assert events == []
+
+    # unsupported attributes are still marked by the read itself
+    assert cluster.is_attribute_unsupported("model")
+
+
 async def test_read_attributes_cached(cluster):
     cluster.request = MagicMock()
     cluster._attr_cache.set_value(Basic.AttributeDefs.zcl_version, 99)

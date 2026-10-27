@@ -1302,45 +1302,12 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, EventBase):
                     value = _convert_attribute_value(attr_def, record.value)
 
                 success[attribute_map[attr_def]] = value
-
-                cached_value = self._legacy_apply_quirk_attribute_update(
-                    attr_def, value
+                self._store_read_attribute_value(
+                    attr_def,
+                    value,
+                    raw_value=record.value.value,
+                    manufacturer_code=manufacturer_code,
                 )
-
-                if cached_value is None:
-                    # Quirk swallowed the attribute
-                    continue
-                elif cached_value != value:
-                    # Quirk transformed the value, emit AttributeUpdatedEvent
-                    self.emit(
-                        AttributeUpdatedEvent.event_type,
-                        AttributeUpdatedEvent(
-                            device_ieee=str(self.endpoint.device.ieee),
-                            endpoint_id=self.endpoint.endpoint_id,
-                            cluster_type=self._type,
-                            cluster_id=self.cluster_id,
-                            attribute_name=attr_def.name,
-                            attribute_id=attr_def.id,
-                            manufacturer_code=manufacturer_code,
-                            value=cached_value,
-                        ),
-                    )
-                else:
-                    # Value unchanged, emit AttributeReadEvent
-                    self.emit(
-                        AttributeReadEvent.event_type,
-                        AttributeReadEvent(
-                            device_ieee=str(self.endpoint.device.ieee),
-                            endpoint_id=self.endpoint.endpoint_id,
-                            cluster_type=self._type,
-                            cluster_id=self.cluster_id,
-                            attribute_name=attr_def.name,
-                            attribute_id=attr_def.id,
-                            manufacturer_code=manufacturer_code,
-                            raw_value=record.value.value,
-                            value=value,
-                        ),
-                    )
             else:
                 if record.status == foundation.Status.UNSUPPORTED_ATTRIBUTE:
                     self.emit(
@@ -1370,6 +1337,60 @@ class Cluster(util.ListenableMixin, util.CatchingTaskMixin, EventBase):
                 failure[attribute_map[attr_def]] = foundation.Status.INSUFFICIENT_SPACE
 
         return insufficient_space_attrs
+
+    def _store_read_attribute_value(
+        self,
+        attr_def: foundation.ZCLAttributeDef,
+        value: Any,
+        *,
+        raw_value: Any,
+        manufacturer_code: int | None,
+    ) -> None:
+        """Store a successfully read attribute value and emit an event for it.
+
+        This is called for every successful record of a Read Attributes Response,
+        after the value was added to the read result, so it can't change the value
+        returned to the caller. Attribute reports don't go through it.
+
+        Quirks serving reads from local data instead of the device can override this
+        to keep the result from being fed back into the attribute cache.
+        """
+        cached_value = self._legacy_apply_quirk_attribute_update(attr_def, value)
+
+        if cached_value is None:
+            # Quirk swallowed the attribute
+            return
+        elif cached_value != value:
+            # Quirk transformed the value, emit AttributeUpdatedEvent
+            self.emit(
+                AttributeUpdatedEvent.event_type,
+                AttributeUpdatedEvent(
+                    device_ieee=str(self.endpoint.device.ieee),
+                    endpoint_id=self.endpoint.endpoint_id,
+                    cluster_type=self._type,
+                    cluster_id=self.cluster_id,
+                    attribute_name=attr_def.name,
+                    attribute_id=attr_def.id,
+                    manufacturer_code=manufacturer_code,
+                    value=cached_value,
+                ),
+            )
+        else:
+            # Value unchanged, emit AttributeReadEvent
+            self.emit(
+                AttributeReadEvent.event_type,
+                AttributeReadEvent(
+                    device_ieee=str(self.endpoint.device.ieee),
+                    endpoint_id=self.endpoint.endpoint_id,
+                    cluster_type=self._type,
+                    cluster_id=self.cluster_id,
+                    attribute_name=attr_def.name,
+                    attribute_id=attr_def.id,
+                    manufacturer_code=manufacturer_code,
+                    raw_value=raw_value,
+                    value=value,
+                ),
+            )
 
     def _on_attribute_unsupported(self, event: AttributeUnsupportedEvent) -> None:
         """Handle an attribute being reported as unsupported by the device."""
